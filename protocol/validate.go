@@ -16,7 +16,11 @@ func (e Envelope) Validate() error {
 		if e.RequestID != 0 || e.Sequence != 0 {
 			return errors.New("protocol: hello has correlation fields")
 		}
-	case KindSnapshot, KindAdded, KindReplaced, KindClosed, KindHistoryAdded, KindHistoryRemoved,
+	case KindSnapshot:
+		if e.RequestID != 0 {
+			return errors.New("protocol: snapshot has a request ID")
+		}
+	case KindAdded, KindReplaced, KindClosed, KindHistoryAdded, KindHistoryRemoved,
 		KindHistorySeen, KindHistoryCleared:
 		if e.Sequence == 0 || e.RequestID != 0 {
 			return errors.New("protocol: state message has invalid sequence")
@@ -59,9 +63,6 @@ func (h Hello) Validate(role string) error {
 }
 
 func (s Snapshot) Validate() error {
-	if s.Sequence == 0 {
-		return errors.New("protocol: snapshot sequence is zero")
-	}
 	if len(s.Active) > MaxActiveNotifications || len(s.History) > MaxHistoryEntries {
 		return errors.New("protocol: snapshot exceeds record limit")
 	}

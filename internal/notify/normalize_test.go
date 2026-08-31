@@ -44,6 +44,7 @@ func TestNormalizeFields(t *testing.T) {
 			HintCategory:               "transfer.complete",
 			HintValue:                  int32(73),
 			HintPrivate:                true,
+			HintResident:               true,
 			HintInlineReplyPlaceholder: "Type a response",
 		},
 		Sender: Sender{Name: ":1.42", PID: 42},
@@ -55,7 +56,7 @@ func TestNormalizeFields(t *testing.T) {
 	if len(got.Actions) != 2 || got.Actions[1].Key != "reply" {
 		t.Fatalf("Actions = %#v", got.Actions)
 	}
-	if got.Urgency != protocol.UrgencyCritical || !got.Transient || !got.Private {
+	if got.Urgency != protocol.UrgencyCritical || !got.Transient || !got.Private || !got.Resident {
 		t.Fatalf("typed hints = %#v", got)
 	}
 	if got.DesktopEntry != "browser.desktop" || got.Category != "transfer.complete" {

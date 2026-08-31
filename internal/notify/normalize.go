@@ -65,6 +65,12 @@ func Normalize(request Request) (Candidate, error) {
 			if !ok {
 				return Candidate{}, errors.New("notify: invalid private hint")
 			}
+		case HintResident:
+			var ok bool
+			candidate.Resident, ok = value.(bool)
+			if !ok {
+				return Candidate{}, errors.New("notify: invalid resident hint")
+			}
 		case HintDesktopEntry:
 			var ok bool
 			candidate.DesktopEntry, ok = value.(string)

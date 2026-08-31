@@ -54,6 +54,15 @@ func TestSnapshotRoundTripAndValidate(t *testing.T) {
 	}
 }
 
+func TestFreshSnapshotMayUseSequenceZero(t *testing.T) {
+	if err := (Snapshot{}).Validate(); err != nil {
+		t.Fatalf("empty baseline snapshot: %v", err)
+	}
+	if err := (Envelope{Kind: KindSnapshot, Payload: json.RawMessage(`{}`)}).Validate(); err != nil {
+		t.Fatalf("empty baseline envelope: %v", err)
+	}
+}
+
 func TestHelloValidation(t *testing.T) {
 	valid := Hello{Major: ProtocolMajor, Minor: ProtocolMinor, Role: RolePresenter, Capabilities: []string{"persistence", "actions"}}
 	if err := valid.Validate(RolePresenter); err != nil {
@@ -90,7 +99,6 @@ func TestEnvelopeValidation(t *testing.T) {
 	}
 	for _, envelope := range []Envelope{
 		{Kind: "future", Payload: json.RawMessage(`{}`)},
-		{Kind: KindSnapshot, Payload: json.RawMessage(`{}`)},
 		{Kind: KindCommand, Payload: json.RawMessage(`{}`)},
 		{Kind: KindHello},
 	} {

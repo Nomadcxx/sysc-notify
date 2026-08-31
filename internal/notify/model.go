@@ -9,6 +9,7 @@ const (
 	HintCategory               = "category"
 	HintValue                  = "value"
 	HintPrivate                = "x-sysc-private"
+	HintResident               = "resident"
 	HintInlineReplyPlaceholder = "x-kde-reply-placeholder-text"
 	HintImageData              = "image-data"
 )
@@ -33,7 +34,7 @@ type Candidate struct {
 	Actions                         []protocol.Action
 	Urgency                         protocol.Urgency
 	ExpireTimeout                   int32
-	Transient, Private              bool
+	Transient, Private, Resident    bool
 	DesktopEntry, Category          string
 	Value                           *int32
 	InlineReply                     bool
