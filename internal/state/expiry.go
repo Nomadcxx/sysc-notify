@@ -88,6 +88,15 @@ func (s *ownerState) setPresentation(record *record, next protocol.PresentationS
 
 func (s *ownerState) handleTimer() {
 	now := s.clock.Now()
+	if !s.nextHistorySweep.IsZero() && !s.nextHistorySweep.After(now) {
+		removed, err := s.history.Sweep(now)
+		if err == nil {
+			for _, id := range removed {
+				s.publishDelta(protocol.Delta{Kind: protocol.DeltaHistoryRemoved, ID: id})
+			}
+		}
+		s.nextHistorySweep = now.Add(HistorySweep)
+	}
 	if !s.leaseDeadline.IsZero() && !s.leaseDeadline.After(now) {
 		expiredAt := s.leaseDeadline
 		s.clearPresentation(expiredAt)
@@ -107,7 +116,10 @@ func (s *ownerState) resetTimer() {
 		s.timerC = nil
 	}
 	var next time.Time
-	if !s.leaseDeadline.IsZero() {
+	if !s.nextHistorySweep.IsZero() {
+		next = s.nextHistorySweep
+	}
+	if !s.leaseDeadline.IsZero() && (next.IsZero() || s.leaseDeadline.Before(next)) {
 		next = s.leaseDeadline
 	}
 	for _, id := range s.order {

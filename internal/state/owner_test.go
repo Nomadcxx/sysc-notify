@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Nomadcxx/sysc-notify/internal/history"
 	"github.com/Nomadcxx/sysc-notify/internal/notify"
 	"github.com/Nomadcxx/sysc-notify/protocol"
 )
@@ -34,6 +35,111 @@ func TestOwnerSequencesAddAndReplacement(t *testing.T) {
 	if len(snapshot.Active) != 1 || snapshot.Active[0].Summary != "replacement" || len(snapshot.History) != 0 {
 		t.Fatalf("snapshot = %#v", snapshot)
 	}
+}
+
+func TestOwnerPersistsOnlyEligibleClosedHistory(t *testing.T) {
+	clock := newManualClock()
+	stateHome := t.TempDir()
+	store, err := history.OpenAt(stateHome, clock.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := StartWithHistory(clock, newEventSink(), store)
+	ordinary := candidate("ordinary", time.Minute)
+	ordinary.AppName = "Browser"
+	ordinary.Actions = []protocol.Action{{Key: "open", Label: "Open"}}
+	ordinary.Sender = notify.Sender{Name: ":1.42", PID: 1234}
+	ordinaryID := do(t, owner, Command{Kind: Add, Candidate: ordinary}).ID
+	do(t, owner, Command{Kind: Dismiss, ID: ordinaryID})
+	for _, ineligible := range []notify.Candidate{
+		func() notify.Candidate { c := candidate("private", time.Minute); c.Private = true; return c }(),
+		func() notify.Candidate { c := candidate("transient", time.Minute); c.Transient = true; return c }(),
+	} {
+		id := do(t, owner, Command{Kind: Add, Candidate: ineligible}).ID
+		do(t, owner, Command{Kind: Dismiss, ID: id})
+	}
+	if err := owner.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := history.OpenAt(stateHome, clock.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := StartWithHistory(clock, newEventSink(), reopened)
+	t.Cleanup(func() { _ = restarted.Close() })
+	got := snapshot(t, restarted)
+	if len(got.Active) != 0 || len(got.History) != 1 {
+		t.Fatalf("restart snapshot = %#v", got)
+	}
+	entry := got.History[0]
+	if entry.ID != ordinaryID || entry.AppName != "Browser" || entry.Summary != "ordinary" {
+		t.Fatalf("history entry = %#v", entry)
+	}
+}
+
+func TestOwnerHistoryCommandsDoNotMutateActiveOrExistingHistory(t *testing.T) {
+	clock := newManualClock()
+	store, err := history.OpenAt(t.TempDir(), clock.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := newEventSink()
+	owner := StartWithHistory(clock, sink, store)
+	t.Cleanup(func() { _ = owner.Close() })
+
+	closedID := do(t, owner, Command{Kind: Add, Candidate: candidate("closed", time.Minute)}).ID
+	do(t, owner, Command{Kind: Dismiss, ID: closedID})
+	activeID := do(t, owner, Command{Kind: Add, Candidate: candidate("active", 0)}).ID
+	do(t, owner, Command{Kind: HistoryMarkSeen, IDs: []uint32{closedID}})
+	if got := snapshot(t, owner); len(got.History) != 1 || !got.History[0].Seen || !hasID(got, activeID) {
+		t.Fatalf("mark seen snapshot = %#v", got)
+	}
+	do(t, owner, Command{Kind: HistoryClear})
+	if got := snapshot(t, owner); len(got.History) != 0 || !hasID(got, activeID) {
+		t.Fatalf("clear snapshot = %#v", got)
+	}
+
+	preservedID := do(t, owner, Command{Kind: Add, Candidate: candidate("preserved", time.Minute)}).ID
+	do(t, owner, Command{Kind: Dismiss, ID: preservedID})
+	do(t, owner, Command{Kind: DismissAll})
+	got := snapshot(t, owner)
+	if len(got.Active) != 0 || !historyHasID(got, preservedID) {
+		t.Fatalf("dismiss all snapshot = %#v", got)
+	}
+	events := sink.Events()
+	seen, cleared := false, false
+	for _, event := range events {
+		if event.Delta == nil {
+			continue
+		}
+		seen = seen || event.Delta.Kind == protocol.DeltaHistorySeen
+		cleared = cleared || event.Delta.Kind == protocol.DeltaHistoryCleared
+	}
+	if !seen || !cleared {
+		t.Fatalf("history command events missing: %#v", events)
+	}
+}
+
+func TestOwnerSweepsHistoryEveryMinute(t *testing.T) {
+	clock := newManualClock()
+	store, err := history.OpenAt(t.TempDir(), clock.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := StartWithHistory(clock, newEventSink(), store)
+	t.Cleanup(func() { _ = owner.Close() })
+	id := do(t, owner, Command{Kind: Add, Candidate: candidate("old", time.Minute)}).ID
+	do(t, owner, Command{Kind: Dismiss, ID: id})
+	clock.Advance(protocol.HistoryRetention + time.Minute)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if len(snapshot(t, owner).History) == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("expired history was not swept")
 }
 
 func TestOwnerClosePathsUseTypedReasons(t *testing.T) {
@@ -174,6 +280,15 @@ func snapshot(t *testing.T, owner *Owner) protocol.Snapshot {
 
 func hasID(snapshot protocol.Snapshot, id uint32) bool {
 	for _, record := range snapshot.Active {
+		if record.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func historyHasID(snapshot protocol.Snapshot, id uint32) bool {
+	for _, record := range snapshot.History {
 		if record.ID == id {
 			return true
 		}

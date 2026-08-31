@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Nomadcxx/sysc-notify/internal/history"
 	"github.com/Nomadcxx/sysc-notify/internal/notify"
 	"github.com/Nomadcxx/sysc-notify/protocol"
 )
@@ -14,6 +15,7 @@ import (
 const (
 	DefaultTimeout    = 5 * time.Second
 	PresentationLease = 6 * time.Second
+	HistorySweep      = time.Minute
 )
 
 var ErrNotFound = errors.New("state: notification not found")
@@ -60,6 +62,8 @@ const (
 	PresentationRenew
 	PresenterLost
 	DismissAll
+	HistoryClear
+	HistoryMarkSeen
 )
 
 type Command struct {
@@ -69,6 +73,7 @@ type Command struct {
 	ActionKey     string
 	ReplyText     string
 	Generation    uint64
+	IDs           []uint32
 	Presentations []protocol.Presentation
 }
 
@@ -97,6 +102,10 @@ type response struct {
 }
 
 func Start(clock Clock, sink Sink) *Owner {
+	return StartWithHistory(clock, sink, nil)
+}
+
+func StartWithHistory(clock Clock, sink Sink, store *history.Store) *Owner {
 	if clock == nil {
 		clock = systemClock{}
 	}
@@ -105,7 +114,7 @@ func Start(clock Clock, sink Sink) *Owner {
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
 	}
-	go o.run(clock, sink)
+	go o.run(clock, sink, store)
 	return o
 }
 
@@ -160,11 +169,15 @@ func (o *Owner) Close() error {
 	return nil
 }
 
-func (o *Owner) run(clock Clock, sink Sink) {
+func (o *Owner) run(clock Clock, sink Sink, store *history.Store) {
 	defer close(o.done)
 	state := ownerState{
-		clock: clock, sink: sink, records: make(map[uint32]*record), nextID: 1,
+		clock: clock, sink: sink, history: store, records: make(map[uint32]*record), nextID: 1,
 	}
+	if store != nil {
+		state.nextHistorySweep = clock.Now().Add(HistorySweep)
+	}
+	state.resetTimer()
 	for {
 		select {
 		case request := <-o.requests:
@@ -199,8 +212,9 @@ type record struct {
 }
 
 type ownerState struct {
-	clock Clock
-	sink  Sink
+	clock   Clock
+	sink    Sink
+	history *history.Store
 
 	records  map[uint32]*record
 	order    []uint32
@@ -211,6 +225,7 @@ type ownerState struct {
 	leaseDeadline       time.Time
 	timer               Timer
 	timerC              <-chan time.Time
+	nextHistorySweep    time.Time
 }
 
 func (s *ownerState) do(command Command) (Result, error) {
@@ -234,10 +249,15 @@ func (s *ownerState) do(command Command) (Result, error) {
 		}
 		return Result{}, nil
 	case DismissAll:
+		var result error
 		for _, id := range append([]uint32(nil), s.order...) {
-			_ = s.close(id, protocol.CloseDismissed)
+			result = errors.Join(result, s.close(id, protocol.CloseDismissed))
 		}
-		return Result{}, nil
+		return Result{}, result
+	case HistoryClear:
+		return Result{}, s.clearHistory()
+	case HistoryMarkSeen:
+		return Result{}, s.markHistorySeen(command.IDs)
 	default:
 		return Result{}, errors.New("state: unknown command")
 	}
@@ -328,7 +348,8 @@ func candidateDuration(candidate notify.Candidate) time.Duration {
 }
 
 func (s *ownerState) close(id uint32, reason protocol.CloseReason) error {
-	if _, exists := s.records[id]; !exists {
+	record, exists := s.records[id]
+	if !exists {
 		return ErrNotFound
 	}
 	delete(s.records, id)
@@ -339,6 +360,55 @@ func (s *ownerState) close(id uint32, reason protocol.CloseReason) error {
 		}
 	}
 	s.publishDelta(protocol.Delta{Kind: protocol.DeltaClosed, ID: id, CloseReason: reason})
+	if s.history != nil && !record.candidate.Transient && !record.candidate.Private {
+		entry, removed, err := s.history.Add(historyEntry(record.notification), s.clock.Now())
+		if err != nil {
+			return err
+		}
+		for _, removedID := range removed {
+			s.publishDelta(protocol.Delta{Kind: protocol.DeltaHistoryRemoved, ID: removedID})
+		}
+		if entry.ID != 0 {
+			s.publishDelta(protocol.Delta{Kind: protocol.DeltaHistoryAdded, History: cloneHistoryPointer(entry)})
+		}
+	}
+	return nil
+}
+
+func historyEntry(notification protocol.Notification) protocol.HistoryEntry {
+	return protocol.HistoryEntry{
+		ID: notification.ID, AppName: notification.AppName, AppIcon: notification.AppIcon,
+		DesktopEntry: notification.DesktopEntry, Summary: notification.Summary, Body: notification.Body,
+		Urgency: notification.Urgency, Category: notification.Category, Timestamp: notification.Timestamp,
+		Image: cloneImage(notification.Image),
+	}
+}
+
+func (s *ownerState) clearHistory() error {
+	if s.history == nil {
+		return errors.New("state: history unavailable")
+	}
+	removed, err := s.history.Clear()
+	if err != nil {
+		return err
+	}
+	if len(removed) != 0 {
+		s.publishDelta(protocol.Delta{Kind: protocol.DeltaHistoryCleared})
+	}
+	return nil
+}
+
+func (s *ownerState) markHistorySeen(ids []uint32) error {
+	if s.history == nil {
+		return errors.New("state: history unavailable")
+	}
+	changed, err := s.history.MarkSeen(ids)
+	if err != nil {
+		return err
+	}
+	if len(changed) != 0 {
+		s.publishDelta(protocol.Delta{Kind: protocol.DeltaHistorySeen, IDs: append([]uint32(nil), changed...)})
+	}
 	return nil
 }
 
@@ -421,7 +491,16 @@ func (s *ownerState) snapshot() protocol.Snapshot {
 	for _, id := range s.order {
 		snapshot.Active = append(snapshot.Active, cloneNotification(s.records[id].notification))
 	}
+	if s.history != nil {
+		snapshot.History = s.history.Entries()
+	}
 	return snapshot
+}
+
+func cloneHistoryPointer(entry protocol.HistoryEntry) *protocol.HistoryEntry {
+	cloned := entry
+	cloned.Image = cloneImage(entry.Image)
+	return &cloned
 }
 
 func cloneNotificationPointer(notification protocol.Notification) *protocol.Notification {
