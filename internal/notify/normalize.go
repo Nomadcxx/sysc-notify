@@ -27,10 +27,12 @@ func Normalize(request Request) (Candidate, error) {
 		return Candidate{}, errors.New("notify: invalid action list")
 	}
 
+	sender := request.Sender
+	sender.Lineage = append([]protocol.Process(nil), request.Sender.Lineage...)
 	candidate := Candidate{
 		AppName: request.AppName, AppIcon: request.AppIcon, Summary: request.Summary, Body: request.Body,
 		ReplacesID: request.ReplacesID, ExpireTimeout: request.ExpireTimeout,
-		Urgency: protocol.UrgencyNormal, Sender: request.Sender,
+		Urgency: protocol.UrgencyNormal, Sender: sender,
 	}
 	actionKeys := make(map[string]struct{}, len(request.Actions)/2)
 	for i := 0; i < len(request.Actions); i += 2 {

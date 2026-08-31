@@ -15,8 +15,9 @@ const (
 )
 
 type Sender struct {
-	Name string
-	PID  uint32
+	Name    string
+	PID     uint32
+	Lineage []protocol.Process
 }
 
 type Request struct {

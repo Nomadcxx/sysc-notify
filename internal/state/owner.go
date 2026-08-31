@@ -333,6 +333,7 @@ func notificationFromCandidate(id uint32, candidate notify.Candidate, now time.T
 		Actions: append([]protocol.Action(nil), candidate.Actions...), Urgency: candidate.Urgency,
 		Category: candidate.Category, Timestamp: now.UTC(), ExpireTimeoutMS: candidate.ExpireTimeout,
 		Image: cloneImage(candidate.Image), Value: value, InlineReply: candidate.InlineReply,
+		SenderLineage: append([]protocol.Process(nil), candidate.Sender.Lineage...),
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"github.com/godbus/dbus/v5"
 
 	"github.com/Nomadcxx/sysc-notify/internal/notify"
+	sendermeta "github.com/Nomadcxx/sysc-notify/internal/sender"
 	"github.com/Nomadcxx/sysc-notify/internal/state"
 	"github.com/Nomadcxx/sysc-notify/protocol"
 )
@@ -30,7 +31,8 @@ const (
 const ObjectPath dbus.ObjectPath = "/org/freedesktop/Notifications"
 
 type Server struct {
-	conn *dbus.Conn
+	conn     *dbus.Conn
+	procRoot string
 
 	mu        sync.RWMutex
 	owner     *state.Owner
@@ -50,8 +52,12 @@ type endpoint struct {
 }
 
 func New(conn *dbus.Conn) *Server {
+	return NewAt(conn, "/proc")
+}
+
+func NewAt(conn *dbus.Conn, procRoot string) *Server {
 	return &Server{
-		conn: conn, signals: make(chan *dbus.Signal, 8), stop: make(chan struct{}),
+		conn: conn, procRoot: procRoot, signals: make(chan *dbus.Signal, 8), stop: make(chan struct{}),
 		done: make(chan error, 1), monitorDone: make(chan struct{}),
 	}
 }
@@ -198,7 +204,7 @@ func (e endpoint) Notify(sender dbus.Sender, appName string, replacesID uint32, 
 	candidate, err := notify.Normalize(notify.Request{
 		AppName: appName, ReplacesID: replacesID, AppIcon: appIcon, Summary: summary, Body: body,
 		Actions: actions, Hints: hints, ExpireTimeout: expireTimeout,
-		Sender: notify.Sender{Name: string(sender), PID: pid},
+		Sender: notify.Sender{Name: string(sender), PID: pid, Lineage: sendermeta.Capture(e.server.procRoot, pid)},
 	})
 	if err != nil {
 		return 0, busError(dbusInvalidArgs, err)

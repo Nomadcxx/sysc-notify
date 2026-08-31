@@ -3,7 +3,11 @@ package fdo
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -130,6 +134,24 @@ func TestServerConvertsImageDataOverDBus(t *testing.T) {
 	}
 }
 
+func TestServerCapturesSenderLineage(t *testing.T) {
+	root := t.TempDir()
+	pid := uint32(os.Getpid())
+	writeProcessStat(t, root, pid, 1, 30)
+	writeProcessStat(t, root, 1, 0, 10)
+	h := startHarnessAt(t, nil, root)
+
+	id := sendNotify(t, h.object, 0, "lineage", nil, 0)
+	snapshot, err := h.owner.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []protocol.Process{{PID: pid, StartTime: 30}, {PID: 1, StartTime: 10}}
+	if len(snapshot.Active) != 1 || snapshot.Active[0].ID != id || !reflect.DeepEqual(snapshot.Active[0].SenderLineage, want) {
+		t.Fatalf("sender lineage = %#v, want %#v", snapshot.Active, want)
+	}
+}
+
 func TestServerEmitsCloseReasons(t *testing.T) {
 	h := startHarness(t, nil)
 	signals := watchSignals(t, h.client)
@@ -190,13 +212,17 @@ type harness struct {
 }
 
 func startHarness(t *testing.T, clock state.Clock) harness {
+	return startHarnessAt(t, clock, t.TempDir())
+}
+
+func startHarnessAt(t *testing.T, clock state.Clock, procRoot string) harness {
 	t.Helper()
 	requireSessionBus(t)
 	serverConn, err := dbus.ConnectSessionBus()
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := New(serverConn)
+	server := NewAt(serverConn, procRoot)
 	owner := state.Start(clock, server)
 	if err := server.Serve(owner); err != nil {
 		_ = owner.Close()
@@ -214,6 +240,25 @@ func startHarness(t *testing.T, clock state.Clock) harness {
 		_ = serverConn.Close()
 	})
 	return harness{server: server, owner: owner, client: client, object: client.Object(BusName, ObjectPath)}
+}
+
+func writeProcessStat(t *testing.T, root string, pid, parent uint32, start uint64) {
+	t.Helper()
+	dir := filepath.Join(root, strconv.FormatUint(uint64(pid), 10))
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fields := make([]string, 20)
+	for i := range fields {
+		fields[i] = "0"
+	}
+	fields[0] = "S"
+	fields[1] = strconv.FormatUint(uint64(parent), 10)
+	fields[19] = strconv.FormatUint(start, 10)
+	contents := fmt.Sprintf("%d (dbus client) %s\n", pid, strings.Join(fields, " "))
+	if err := os.WriteFile(filepath.Join(dir, "stat"), []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func sendNotify(t *testing.T, object dbus.BusObject, replacesID uint32, summary string, hints map[string]dbus.Variant, timeout int32) uint32 {
