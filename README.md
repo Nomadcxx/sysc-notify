@@ -4,8 +4,6 @@
 `org.freedesktop.Notifications` D-Bus interface and sends renderer-neutral notification state to
 [`sysc-shell`](https://github.com/Nomadcxx/sysc-shell).
 
-The repository is in the design stage. It contains no production daemon yet.
-
 ## Responsibilities
 
 The first releases will provide:
@@ -21,19 +19,30 @@ The first releases will provide:
 Wayland, create windows, or focus compositor windows. It continues accepting a bounded number of
 notifications while the shell is unavailable.
 
-Initial history is memory-only. Persistent history, cross-compositor focus integration, and a second UI
-frontend require later design gates.
+The service stores bounded public history under the XDG state directory. It does not persist private or
+transient notifications, sender PIDs, actions, or reply data.
 
-## Development gates
+## Run
 
-1. Pin the freedesktop 1.3 contract and its trust-boundary limits in tests.
-2. Implement the D-Bus service, lifecycle, replacement, expiry, actions, and close signals.
-3. Add bounded shell IPC with reconnect snapshots and backpressure.
-4. Integrate shell-owned popup rendering and unambiguous notification-to-window focus.
-5. Qualify common applications and shell restart behavior before `v0.1.0`.
+```sh
+go build ./cmd/sysc-notify
+./sysc-notify
+```
+
+The daemon requires a session bus and `XDG_RUNTIME_DIR`. It creates the presenter socket at
+`$XDG_RUNTIME_DIR/sysc-notify/presenter.v1.sock`. History defaults to
+`$XDG_STATE_HOME/sysc-notify/history.json`, or `~/.local/state/sysc-notify/history.json` when
+`XDG_STATE_HOME` is unset. `SIGINT` and `SIGTERM` trigger a clean shutdown.
+
+Run the automated gate with:
+
+```sh
+go vet ./...
+go test -race -count=1 ./...
+dbus-run-session -- go test -race -count=1 ./tests/integration/
+```
 
 See the [design](docs/plans/2026-08-27-sysc-notify-design.md) and [roadmap](docs/roadmap.md).
-Package directories will arrive with their first tested behavior.
 
 ## Licence
 
