@@ -93,7 +93,7 @@ func TestSlowPresenterIsDroppedWithoutBlockingDBus(t *testing.T) {
 	defer slow.Close()
 	if err := writeEnvelope(slow, protocol.KindHello, 0, 0, protocol.Hello{
 		Major: protocol.ProtocolMajor, Minor: protocol.ProtocolMinor, Role: protocol.RolePresenter,
-		Capabilities: []string{presenter.RequiredCapability},
+		Capabilities: []string{presenter.RequiredCapability, presenter.RequiredLifetimeCapability},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func connectPresenterSnapshot(t *testing.T, runtimeDir string) (*net.UnixConn, p
 	conn := dialPresenter(t, runtimeDir)
 	if err := writeEnvelope(conn, protocol.KindHello, 0, 0, protocol.Hello{
 		Major: protocol.ProtocolMajor, Minor: protocol.ProtocolMinor, Role: protocol.RolePresenter,
-		Capabilities: []string{presenter.RequiredCapability},
+		Capabilities: []string{presenter.RequiredCapability, presenter.RequiredLifetimeCapability},
 	}); err != nil {
 		_ = conn.Close()
 		t.Fatal(err)

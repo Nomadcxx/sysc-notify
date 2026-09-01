@@ -7,7 +7,7 @@ import (
 
 const (
 	ProtocolMajor uint16 = 1
-	ProtocolMinor uint16 = 0
+	ProtocolMinor uint16 = 1
 
 	RolePresenter = "presenter"
 
@@ -57,9 +57,10 @@ type Hello struct {
 }
 
 type Snapshot struct {
-	Sequence uint64         `json:"sequence"`
-	Active   []Notification `json:"active"`
-	History  []HistoryEntry `json:"history"`
+	Sequence  uint64         `json:"sequence"`
+	Active    []Notification `json:"active"`
+	Lifetimes []Lifetime     `json:"lifetimes"`
+	History   []HistoryEntry `json:"history"`
 }
 
 type Urgency uint8
@@ -143,6 +144,7 @@ const (
 type Delta struct {
 	Kind         DeltaKind     `json:"kind"`
 	Notification *Notification `json:"notification,omitempty"`
+	Lifetime     *Lifetime     `json:"lifetime,omitempty"`
 	History      *HistoryEntry `json:"history,omitempty"`
 	ID           uint32        `json:"id,omitempty"`
 	IDs          []uint32      `json:"ids,omitempty"`
@@ -161,6 +163,16 @@ const (
 type Presentation struct {
 	ID    uint32            `json:"id"`
 	State PresentationState `json:"state"`
+}
+
+// Lifetime is the service-owned expiry state for one active notification.
+// Running is false while the service has paused RemainingMS for a queued or
+// hovered presentation. A zero duration is persistent and never runs.
+type Lifetime struct {
+	ID          uint32 `json:"id"`
+	DurationMS  uint32 `json:"duration_ms"`
+	RemainingMS uint32 `json:"remaining_ms"`
+	Running     bool   `json:"running"`
 }
 
 type CommandKind string
@@ -200,6 +212,7 @@ type ProtocolError struct {
 }
 
 type Reply struct {
-	OK    bool           `json:"ok"`
-	Error *ProtocolError `json:"error,omitempty"`
+	OK        bool           `json:"ok"`
+	Error     *ProtocolError `json:"error,omitempty"`
+	Lifetimes []Lifetime     `json:"lifetimes,omitempty"`
 }

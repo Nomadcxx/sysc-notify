@@ -45,6 +45,48 @@ func TestHoverPausesAndVisibleResumesRemainingTimeout(t *testing.T) {
 	waitForMissing(t, owner, id)
 }
 
+func TestSnapshotAndRenewExposeAuthoritativeLifetime(t *testing.T) {
+	clock, owner := startClockOwner(t)
+	id := do(t, owner, Command{Kind: Add, Candidate: candidate("countdown", 10*time.Second)}).ID
+
+	initial := lifetimeFor(t, snapshot(t, owner).Lifetimes, id)
+	if initial.DurationMS != 10_000 || initial.RemainingMS != 10_000 || !initial.Running {
+		t.Fatalf("initial lifetime = %#v", initial)
+	}
+
+	clock.Advance(3 * time.Second)
+	paused := do(t, owner, Command{
+		Kind: PresentationRenew, Generation: 1,
+		Presentations: []protocol.Presentation{{ID: id, State: protocol.PresentationHovered}},
+	})
+	got := lifetimeFor(t, paused.Lifetimes, id)
+	if got.DurationMS != 10_000 || got.RemainingMS != 7_000 || got.Running {
+		t.Fatalf("paused lifetime = %#v", got)
+	}
+	if reconnect := lifetimeFor(t, snapshot(t, owner).Lifetimes, id); reconnect != got {
+		t.Fatalf("reconnect lifetime = %#v, want %#v", reconnect, got)
+	}
+
+	resumed := do(t, owner, Command{
+		Kind: PresentationRenew, Generation: 1,
+		Presentations: []protocol.Presentation{{ID: id, State: protocol.PresentationVisible}},
+	})
+	if got := lifetimeFor(t, resumed.Lifetimes, id); got.RemainingMS != 7_000 || !got.Running {
+		t.Fatalf("resumed lifetime = %#v", got)
+	}
+}
+
+func lifetimeFor(t *testing.T, lifetimes []protocol.Lifetime, id uint32) protocol.Lifetime {
+	t.Helper()
+	for _, lifetime := range lifetimes {
+		if lifetime.ID == id {
+			return lifetime
+		}
+	}
+	t.Fatalf("lifetime %d missing from %#v", id, lifetimes)
+	return protocol.Lifetime{}
+}
+
 func TestSuppressedQueuedNotificationCannotSurviveForever(t *testing.T) {
 	clock, owner := startClockOwner(t)
 	id := do(t, owner, Command{Kind: Add, Candidate: candidate("suppressed", 10*time.Second)}).ID

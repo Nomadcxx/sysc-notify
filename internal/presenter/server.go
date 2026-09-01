@@ -20,9 +20,10 @@ import (
 )
 
 const (
-	socketName         = "presenter.v1.sock"
-	RequiredCapability = "notification-state"
-	handshakeTimeout   = 5 * time.Second
+	socketName                 = "presenter.v1.sock"
+	RequiredCapability         = "notification-state"
+	RequiredLifetimeCapability = "presentation-lifetime"
+	handshakeTimeout           = 5 * time.Second
 )
 
 type Server struct {
@@ -183,7 +184,8 @@ func (s *Server) handle(socket *net.UnixConn) {
 		return
 	}
 	hello, err := readHello(socket)
-	if err != nil || !hasCapability(hello.Capabilities, RequiredCapability) {
+	if err != nil || !hasCapability(hello.Capabilities, RequiredCapability) ||
+		!hasCapability(hello.Capabilities, RequiredLifetimeCapability) {
 		return
 	}
 	if err := socket.SetDeadline(time.Time{}); err != nil {
@@ -210,7 +212,7 @@ func (s *Server) handle(socket *net.UnixConn) {
 	}
 	serviceHello := protocol.Hello{
 		Major: protocol.ProtocolMajor, Minor: protocol.ProtocolMinor, Role: protocol.RolePresenter,
-		Capabilities: []string{RequiredCapability, "actions", "history", "inline-reply"},
+		Capabilities: []string{RequiredCapability, RequiredLifetimeCapability, "actions", "history", "inline-reply"},
 	}
 	helloFrame, err := marshalEnvelope(protocol.KindHello, 0, 0, serviceHello)
 	if err != nil {

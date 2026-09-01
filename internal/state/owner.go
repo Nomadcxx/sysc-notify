@@ -78,8 +78,9 @@ type Command struct {
 }
 
 type Result struct {
-	ID       uint32
-	Replaced bool
+	ID        uint32
+	Replaced  bool
+	Lifetimes []protocol.Lifetime
 }
 
 type Owner struct {
@@ -242,7 +243,10 @@ func (s *ownerState) do(command Command) (Result, error) {
 	case SubmitReply:
 		return Result{}, s.submitReply(command.ID, command.ReplyText)
 	case PresentationRenew:
-		return Result{}, s.renew(command.Generation, command.Presentations, now)
+		if err := s.renew(command.Generation, command.Presentations, now); err != nil {
+			return Result{}, err
+		}
+		return Result{Lifetimes: s.lifetimes(now)}, nil
 	case PresenterLost:
 		if command.Generation != 0 && command.Generation == s.presenterGeneration {
 			s.clearPresentation(now)
@@ -304,7 +308,8 @@ func (s *ownerState) add(candidate notify.Candidate, now time.Time) (Result, err
 			}
 		}
 		s.records[id] = record
-		s.publishDelta(protocol.Delta{Kind: protocol.DeltaReplaced, Notification: cloneNotificationPointer(notification)})
+		lifetime := s.lifetime(record, now)
+		s.publishDelta(protocol.Delta{Kind: protocol.DeltaReplaced, Notification: cloneNotificationPointer(notification), Lifetime: &lifetime})
 		return Result{ID: id, Replaced: true}, nil
 	}
 	if duration > 0 {
@@ -313,7 +318,8 @@ func (s *ownerState) add(candidate notify.Candidate, now time.Time) (Result, err
 	}
 	s.records[id] = record
 	s.order = append(s.order, id)
-	s.publishDelta(protocol.Delta{Kind: protocol.DeltaAdded, Notification: cloneNotificationPointer(notification)})
+	lifetime := s.lifetime(record, now)
+	s.publishDelta(protocol.Delta{Kind: protocol.DeltaAdded, Notification: cloneNotificationPointer(notification), Lifetime: &lifetime})
 	return Result{ID: id}, nil
 }
 
@@ -488,7 +494,11 @@ func (s *ownerState) publish(event Event) {
 }
 
 func (s *ownerState) snapshot() protocol.Snapshot {
-	snapshot := protocol.Snapshot{Sequence: s.sequence, Active: make([]protocol.Notification, 0, len(s.order))}
+	snapshot := protocol.Snapshot{
+		Sequence:  s.sequence,
+		Active:    make([]protocol.Notification, 0, len(s.order)),
+		Lifetimes: s.lifetimes(s.clock.Now()),
+	}
 	for _, id := range s.order {
 		snapshot.Active = append(snapshot.Active, cloneNotification(s.records[id].notification))
 	}
@@ -496,6 +506,34 @@ func (s *ownerState) snapshot() protocol.Snapshot {
 		snapshot.History = s.history.Entries()
 	}
 	return snapshot
+}
+
+func (s *ownerState) lifetimes(now time.Time) []protocol.Lifetime {
+	lifetimes := make([]protocol.Lifetime, 0, len(s.order))
+	for _, id := range s.order {
+		lifetimes = append(lifetimes, s.lifetime(s.records[id], now))
+	}
+	return lifetimes
+}
+
+func (s *ownerState) lifetime(record *record, now time.Time) protocol.Lifetime {
+	remaining := record.remaining
+	if record.hasDeadline {
+		remaining = max(0, record.deadline.Sub(now))
+	}
+	return protocol.Lifetime{
+		ID:          record.notification.ID,
+		DurationMS:  durationMilliseconds(record.duration),
+		RemainingMS: durationMilliseconds(remaining),
+		Running:     record.hasDeadline && record.duration > 0,
+	}
+}
+
+func durationMilliseconds(duration time.Duration) uint32 {
+	if duration <= 0 {
+		return 0
+	}
+	return uint32((duration + time.Millisecond - 1) / time.Millisecond)
 }
 
 func cloneHistoryPointer(entry protocol.HistoryEntry) *protocol.HistoryEntry {

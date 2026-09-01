@@ -30,6 +30,7 @@ func TestSnapshotRoundTripAndValidate(t *testing.T) {
 			InlineReply:     true,
 			SenderLineage:   []Process{{PID: 42, StartTime: 1234}},
 		}},
+		Lifetimes: []Lifetime{{ID: 7, DurationMS: 5000, RemainingMS: 5000, Running: true}},
 		History: []HistoryEntry{{
 			ID: 3, AppName: "Mail", Summary: "New mail", Urgency: UrgencyLow, Timestamp: now, Seen: true,
 		}},
@@ -145,6 +146,46 @@ func TestNotificationBounds(t *testing.T) {
 	}
 }
 
+func TestActiveLifetimeValidation(t *testing.T) {
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	notification := Notification{ID: 7, Summary: "active", Urgency: UrgencyNormal, Timestamp: now}
+	lifetime := Lifetime{ID: 7, DurationMS: 10_000, RemainingMS: 7_000, Running: true}
+
+	if err := (Snapshot{Active: []Notification{notification}, Lifetimes: []Lifetime{lifetime}}).Validate(); err != nil {
+		t.Fatalf("valid snapshot: %v", err)
+	}
+	if err := (Delta{Kind: DeltaAdded, Notification: &notification, Lifetime: &lifetime}).Validate(); err != nil {
+		t.Fatalf("valid delta: %v", err)
+	}
+	if err := (Reply{OK: true, Lifetimes: []Lifetime{lifetime}}).Validate(); err != nil {
+		t.Fatalf("valid reply: %v", err)
+	}
+
+	for name, snapshot := range map[string]Snapshot{
+		"missing lifetime": {Active: []Notification{notification}},
+		"orphan lifetime":  {Lifetimes: []Lifetime{lifetime}},
+		"wrong id":         {Active: []Notification{notification}, Lifetimes: []Lifetime{{ID: 8, DurationMS: 10_000}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := snapshot.Validate(); err == nil {
+				t.Fatal("Validate() accepted mismatched active lifetimes")
+			}
+		})
+	}
+
+	for name, lifetime := range map[string]Lifetime{
+		"zero id":             {DurationMS: 1},
+		"remaining too large": {ID: 7, DurationMS: 1, RemainingMS: 2},
+		"persistent running":  {ID: 7, Running: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := lifetime.Validate(); err == nil {
+				t.Fatal("Validate() accepted invalid lifetime")
+			}
+		})
+	}
+}
+
 func TestImageValidationUsesOverflowSafeBounds(t *testing.T) {
 	for name, image := range map[string]Image{
 		"zero width":   {MediaType: "image/png", Height: 1, Data: []byte{1}},
@@ -163,10 +204,11 @@ func TestImageValidationUsesOverflowSafeBounds(t *testing.T) {
 
 func TestDeltaCommandAndReplyValidation(t *testing.T) {
 	n := Notification{ID: 1, Summary: "ok", Urgency: UrgencyNormal, Timestamp: time.Now().UTC()}
+	lifetime := Lifetime{ID: 1, DurationMS: 5000, RemainingMS: 5000, Running: true}
 	h := HistoryEntry{ID: 1, Summary: "ok", Urgency: UrgencyNormal, Timestamp: time.Now().UTC()}
 	for _, delta := range []Delta{
-		{Kind: DeltaAdded, Notification: &n},
-		{Kind: DeltaReplaced, Notification: &n},
+		{Kind: DeltaAdded, Notification: &n, Lifetime: &lifetime},
+		{Kind: DeltaReplaced, Notification: &n, Lifetime: &lifetime},
 		{Kind: DeltaClosed, ID: 1, CloseReason: CloseDismissed},
 		{Kind: DeltaHistoryAdded, History: &h},
 		{Kind: DeltaHistoryRemoved, ID: 1},

@@ -66,6 +66,9 @@ func (s Snapshot) Validate() error {
 	if len(s.Active) > MaxActiveNotifications || len(s.History) > MaxHistoryEntries {
 		return errors.New("protocol: snapshot exceeds record limit")
 	}
+	if len(s.Lifetimes) != len(s.Active) {
+		return errors.New("protocol: active lifetime count does not match records")
+	}
 	active := make(map[uint32]struct{}, len(s.Active))
 	for i := range s.Active {
 		if err := s.Active[i].Validate(); err != nil {
@@ -75,6 +78,18 @@ func (s Snapshot) Validate() error {
 			return fmt.Errorf("protocol: duplicate active ID %d", s.Active[i].ID)
 		}
 		active[s.Active[i].ID] = struct{}{}
+	}
+	for i := range s.Lifetimes {
+		if err := s.Lifetimes[i].Validate(); err != nil {
+			return fmt.Errorf("protocol: lifetime[%d]: %w", i, err)
+		}
+		if _, exists := active[s.Lifetimes[i].ID]; !exists {
+			return fmt.Errorf("protocol: lifetime for unknown active ID %d", s.Lifetimes[i].ID)
+		}
+		delete(active, s.Lifetimes[i].ID)
+	}
+	if len(active) != 0 {
+		return errors.New("protocol: active record has no lifetime")
 	}
 	history := make(map[uint32]struct{}, len(s.History))
 	for i := range s.History {
@@ -180,10 +195,19 @@ func (h HistoryEntry) Validate() error {
 func (d Delta) Validate() error {
 	switch d.Kind {
 	case DeltaAdded, DeltaReplaced:
-		if d.Notification == nil {
-			return errors.New("protocol: notification delta has no record")
+		if d.Notification == nil || d.Lifetime == nil {
+			return errors.New("protocol: notification delta has no record lifetime")
 		}
-		return d.Notification.Validate()
+		if err := d.Notification.Validate(); err != nil {
+			return err
+		}
+		if err := d.Lifetime.Validate(); err != nil {
+			return err
+		}
+		if d.Lifetime.ID != d.Notification.ID {
+			return errors.New("protocol: notification delta lifetime ID does not match record")
+		}
+		return nil
 	case DeltaClosed:
 		if d.ID == 0 || !d.CloseReason.valid() {
 			return errors.New("protocol: invalid closed delta")
@@ -251,13 +275,39 @@ func (r Reply) Validate() error {
 	if r.OK == (r.Error != nil) {
 		return errors.New("protocol: reply must contain one outcome")
 	}
-	if r.Error == nil {
-		return nil
+	if r.Error != nil {
+		if len(r.Lifetimes) != 0 {
+			return errors.New("protocol: error reply has lifetimes")
+		}
+		if !r.Error.Code.valid() {
+			return fmt.Errorf("protocol: invalid error code %q", r.Error.Code)
+		}
+		return validateText("error message", r.Error.Message, MaxBodyBytes, true)
 	}
-	if !r.Error.Code.valid() {
-		return fmt.Errorf("protocol: invalid error code %q", r.Error.Code)
+	seen := make(map[uint32]struct{}, len(r.Lifetimes))
+	for i := range r.Lifetimes {
+		if err := r.Lifetimes[i].Validate(); err != nil {
+			return fmt.Errorf("protocol: reply lifetime[%d]: %w", i, err)
+		}
+		if _, exists := seen[r.Lifetimes[i].ID]; exists {
+			return errors.New("protocol: duplicate reply lifetime")
+		}
+		seen[r.Lifetimes[i].ID] = struct{}{}
 	}
-	return validateText("error message", r.Error.Message, MaxBodyBytes, true)
+	return nil
+}
+
+func (l Lifetime) Validate() error {
+	if l.ID == 0 {
+		return errors.New("protocol: lifetime ID is zero")
+	}
+	if l.RemainingMS > l.DurationMS {
+		return errors.New("protocol: lifetime remaining exceeds duration")
+	}
+	if l.DurationMS == 0 && l.Running {
+		return errors.New("protocol: persistent lifetime is running")
+	}
+	return nil
 }
 
 func validateIDs(ids []uint32, limit int) error {

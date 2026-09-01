@@ -104,6 +104,50 @@ func TestPresenterReceivesSnapshotThenNextDelta(t *testing.T) {
 	}
 }
 
+func TestPresenterRequiresLifetimeCapability(t *testing.T) {
+	h := startServerHarness(t, newPresenterClock())
+	conn := dialSocket(t, h.server.SocketPath())
+	defer conn.Close()
+	hello := protocol.Hello{
+		Major: protocol.ProtocolMajor, Minor: protocol.ProtocolMinor, Role: protocol.RolePresenter,
+		Capabilities: []string{RequiredCapability},
+	}
+	if err := writeEnvelope(conn, protocol.KindHello, 0, 0, hello); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := protocol.ReadFrame(conn); err == nil {
+		t.Fatal("presenter without lifetime capability was accepted")
+	}
+}
+
+func TestPresentationRenewReturnsAuthoritativeLifetimes(t *testing.T) {
+	clock := newPresenterClock()
+	h := startServerHarness(t, clock)
+	id := addCandidate(t, h.owner, "countdown", 10*time.Second)
+	client := connectPresenter(t, h.server.SocketPath())
+	defer client.conn.Close()
+
+	clock.Advance(3 * time.Second)
+	command := protocol.Command{
+		Kind:          protocol.CommandPresentationRenew,
+		Presentations: []protocol.Presentation{{ID: id, State: protocol.PresentationHovered}},
+	}
+	if err := writeEnvelope(client.conn, protocol.KindCommand, 1, 0, command); err != nil {
+		t.Fatal(err)
+	}
+	reply := readReply(t, client.conn, 1)
+	if !reply.OK || len(reply.Lifetimes) != 1 {
+		t.Fatalf("presentation reply = %#v", reply)
+	}
+	got := reply.Lifetimes[0]
+	if got.ID != id || got.DurationMS != 10_000 || got.RemainingMS != 7_000 || got.Running {
+		t.Fatalf("presentation lifetime = %#v", got)
+	}
+}
+
 func TestSecondPresenterReplacesGeneration(t *testing.T) {
 	h := startServerHarness(t, nil)
 	addCandidate(t, h.owner, "record", 0)
@@ -177,6 +221,9 @@ func connectPresenter(t *testing.T, path string) presenterClient {
 	if err := hello.Validate(protocol.RolePresenter); err != nil {
 		t.Fatal(err)
 	}
+	if !hasCapability(hello.Capabilities, RequiredLifetimeCapability) {
+		t.Fatalf("service capabilities = %#v", hello.Capabilities)
+	}
 	snapshotEnvelope := readEnvelope(t, conn)
 	if snapshotEnvelope.Kind != protocol.KindSnapshot {
 		t.Fatalf("second server message = %#v", snapshotEnvelope)
@@ -192,7 +239,7 @@ func connectPresenter(t *testing.T, path string) presenterClient {
 func validHello() protocol.Hello {
 	return protocol.Hello{
 		Major: protocol.ProtocolMajor, Minor: protocol.ProtocolMinor, Role: protocol.RolePresenter,
-		Capabilities: []string{RequiredCapability},
+		Capabilities: []string{RequiredCapability, RequiredLifetimeCapability},
 	}
 }
 

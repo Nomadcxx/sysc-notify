@@ -210,9 +210,9 @@ func executeCommand(owner *state.Owner, generation uint64, command protocol.Comm
 	case protocol.CommandDismissAll:
 		stateCommand.Kind = state.DismissAll
 	}
-	_, err := owner.Do(context.Background(), stateCommand)
+	result, err := owner.Do(context.Background(), stateCommand)
 	if err == nil {
-		return protocol.Reply{OK: true}
+		return protocol.Reply{OK: true, Lifetimes: result.Lifetimes}
 	}
 	code := protocol.ErrorInvalid
 	if errors.Is(err, state.ErrNotFound) {
