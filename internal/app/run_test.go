@@ -11,6 +11,8 @@ import (
 
 	"github.com/godbus/dbus/v5"
 
+	"github.com/Nomadcxx/sysc-notify/internal/dbustest"
+
 	"github.com/Nomadcxx/sysc-notify/internal/fdo"
 )
 
@@ -36,7 +38,7 @@ func TestRunServesUntilCancellationAndCleansUp(t *testing.T) {
 	if info, err := os.Lstat(socket); err != nil || info.Mode()&os.ModeSocket == 0 {
 		t.Fatalf("presenter socket = %#v, %v", info, err)
 	}
-	conn, err := dbus.ConnectSessionBus()
+	conn, err := dbus.Connect(dbustest.Session(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +63,7 @@ func TestRunServesUntilCancellationAndCleansUp(t *testing.T) {
 
 func TestRunUnwindsPresenterWhenBusNameIsTaken(t *testing.T) {
 	requireSessionBus(t)
-	blocker, err := dbus.ConnectSessionBus()
+	blocker, err := dbus.Connect(dbustest.Session(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +131,5 @@ func privateRuntimeDir(t *testing.T) string {
 
 func requireSessionBus(t *testing.T) {
 	t.Helper()
-	if address := os.Getenv("DBUS_SESSION_BUS_ADDRESS"); !strings.Contains(address, "/tmp/") {
-		t.Skip("requires dbus-run-session")
-	}
+	dbustest.Session(t)
 }

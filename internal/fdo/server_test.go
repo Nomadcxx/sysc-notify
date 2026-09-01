@@ -14,13 +14,15 @@ import (
 
 	"github.com/godbus/dbus/v5"
 
+	"github.com/Nomadcxx/sysc-notify/internal/dbustest"
+
 	"github.com/Nomadcxx/sysc-notify/internal/state"
 	"github.com/Nomadcxx/sysc-notify/protocol"
 )
 
 func TestServerOwnsNameOnceAndReportsLoss(t *testing.T) {
 	requireSessionBus(t)
-	firstConn, err := dbus.ConnectSessionBus()
+	firstConn, err := dbus.Connect(dbustest.Session(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +37,7 @@ func TestServerOwnsNameOnceAndReportsLoss(t *testing.T) {
 		_ = firstConn.Close()
 	})
 
-	secondConn, err := dbus.ConnectSessionBus()
+	secondConn, err := dbus.Connect(dbustest.Session(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +220,7 @@ func startHarness(t *testing.T, clock state.Clock) harness {
 func startHarnessAt(t *testing.T, clock state.Clock, procRoot string) harness {
 	t.Helper()
 	requireSessionBus(t)
-	serverConn, err := dbus.ConnectSessionBus()
+	serverConn, err := dbus.Connect(dbustest.Session(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +231,7 @@ func startHarnessAt(t *testing.T, clock state.Clock, procRoot string) harness {
 		_ = serverConn.Close()
 		t.Fatal(err)
 	}
-	client, err := dbus.ConnectSessionBus()
+	client, err := dbus.Connect(dbustest.Session(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +322,5 @@ func assertSignal(t *testing.T, signals <-chan *dbus.Signal, member string, body
 
 func requireSessionBus(t *testing.T) {
 	t.Helper()
-	if address := os.Getenv("DBUS_SESSION_BUS_ADDRESS"); !strings.Contains(address, "/tmp/") {
-		t.Skip("requires dbus-run-session")
-	}
+	dbustest.Session(t)
 }

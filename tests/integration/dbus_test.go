@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -16,16 +15,18 @@ import (
 
 	"github.com/godbus/dbus/v5"
 
+	"github.com/Nomadcxx/sysc-notify/internal/dbustest"
+
 	"github.com/Nomadcxx/sysc-notify/internal/fdo"
 	"github.com/Nomadcxx/sysc-notify/protocol"
 )
 
 var daemonBinary string
 
+// TestMain builds the daemon the cross-process tests execute. Each test starts
+// its own session bus, so the build cannot be conditioned on inheriting one;
+// a test skips itself when no bus daemon is installed.
 func TestMain(m *testing.M) {
-	if !strings.Contains(os.Getenv("DBUS_SESSION_BUS_ADDRESS"), "/tmp/") {
-		os.Exit(m.Run())
-	}
 	_, source, _, _ := runtime.Caller(0)
 	root := filepath.Clean(filepath.Join(filepath.Dir(source), "..", ".."))
 	temporary, err := os.MkdirTemp("", "sysc-notify-integration-")
@@ -125,7 +126,7 @@ func startDaemon(t *testing.T, runtimeDir, stateHome string) *daemon {
 			t.Fatalf("daemon stopped during startup: %v\n%s", err, d.stderr.String())
 		default:
 		}
-		conn, err := dbus.ConnectSessionBus()
+		conn, err := dbus.Connect(dbustest.Session(t))
 		if err == nil {
 			var owned bool
 			err = conn.BusObject().Call("org.freedesktop.DBus.NameHasOwner", 0, fdo.BusName).Store(&owned)
@@ -165,7 +166,7 @@ func (d *daemon) stop(t *testing.T) {
 
 func connectBus(t *testing.T) *dbus.Conn {
 	t.Helper()
-	conn, err := dbus.ConnectSessionBus()
+	conn, err := dbus.Connect(dbustest.Session(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +228,5 @@ func privateRuntimeDir(t *testing.T) string {
 
 func requireSessionBus(t *testing.T) {
 	t.Helper()
-	if !strings.Contains(os.Getenv("DBUS_SESSION_BUS_ADDRESS"), "/tmp/") {
-		t.Skip("requires dbus-run-session")
-	}
+	dbustest.Session(t)
 }
