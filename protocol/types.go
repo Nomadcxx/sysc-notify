@@ -183,6 +183,7 @@ const (
 	CommandDismiss           CommandKind = "notification.dismiss"
 	CommandReply             CommandKind = "notification.reply"
 	CommandHistoryClear      CommandKind = "history.clear"
+	CommandHistoryRemove     CommandKind = "history.remove"
 	CommandHistoryMarkSeen   CommandKind = "history.mark-seen"
 	CommandDismissAll        CommandKind = "active.dismiss-all"
 )

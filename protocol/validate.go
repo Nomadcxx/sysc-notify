@@ -263,7 +263,7 @@ func (c Command) Validate() error {
 		return validateText("reply text", c.Text, MaxBodyBytes, true)
 	case CommandHistoryClear, CommandDismissAll:
 		return nil
-	case CommandHistoryMarkSeen:
+	case CommandHistoryRemove, CommandHistoryMarkSeen:
 		return validateIDs(c.IDs, MaxHistoryEntries)
 	default:
 		return fmt.Errorf("protocol: invalid command kind %q", c.Kind)
