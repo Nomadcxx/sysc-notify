@@ -154,6 +154,35 @@ func (s *Store) Sweep(now time.Time) ([]uint32, error) {
 	return removed, nil
 }
 
+// Remove drops the named entries and returns the ids that were actually
+// present. An unknown id is skipped rather than refused: two shells may remove
+// the same entry, and the loser must not see a failure for work already done.
+func (s *Store) Remove(ids []uint32) ([]uint32, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	drop := make(map[uint32]struct{}, len(ids))
+	for _, id := range ids {
+		drop[id] = struct{}{}
+	}
+	next := make([]protocol.HistoryEntry, 0, len(s.entries))
+	removed := make([]uint32, 0, len(ids))
+	for _, e := range s.entries {
+		if _, ok := drop[e.ID]; ok {
+			removed = append(removed, e.ID)
+			continue
+		}
+		next = append(next, cloneEntry(e))
+	}
+	if len(removed) == 0 {
+		return nil, nil
+	}
+	if err := s.commit(next); err != nil {
+		return nil, err
+	}
+	return removed, nil
+}
+
 func (s *Store) MarkSeen(ids []uint32) ([]uint32, error) {
 	wanted := make(map[uint32]struct{}, len(ids))
 	for _, id := range ids {

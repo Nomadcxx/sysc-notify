@@ -233,6 +233,37 @@ func TestStoreRejectsSymlinkPath(t *testing.T) {
 	}
 }
 
+func TestStoreRemoveDropsKnownIDsOnly(t *testing.T) {
+	stateHome := t.TempDir()
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	s, err := OpenAt(stateHome, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []uint32{1, 2, 3} {
+		if _, _, err := s.Add(testEntry(id, now), now); err != nil {
+			t.Fatalf("seed %d: %v", id, err)
+		}
+	}
+
+	got, err := s.Remove([]uint32{2, 99})
+	if err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if len(got) != 1 || got[0] != 2 {
+		t.Fatalf("removed = %v, want [2]", got)
+	}
+
+	for _, e := range s.Entries() {
+		if e.ID == 2 {
+			t.Fatal("entry 2 survived removal")
+		}
+	}
+	if len(s.Entries()) != 2 {
+		t.Fatalf("entries = %d, want 2", len(s.Entries()))
+	}
+}
+
 func testEntry(id uint32, timestamp time.Time) protocol.HistoryEntry {
 	return protocol.HistoryEntry{ID: id, Summary: "record", Urgency: protocol.UrgencyNormal, Timestamp: timestamp}
 }
