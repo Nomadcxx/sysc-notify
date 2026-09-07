@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -118,6 +119,36 @@ func TestOwnerHistoryCommandsDoNotMutateActiveOrExistingHistory(t *testing.T) {
 	}
 	if !seen || !cleared {
 		t.Fatalf("history command events missing: %#v", events)
+	}
+}
+
+func TestHistoryRemovePublishesOneDeltaPerEntry(t *testing.T) {
+	clock := newManualClock()
+	store, err := history.OpenAt(t.TempDir(), clock.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := newEventSink()
+	owner := StartWithHistory(clock, sink, store)
+	t.Cleanup(func() { _ = owner.Close() })
+
+	var ids []uint32
+	for _, name := range []string{"one", "two", "three"} {
+		id := do(t, owner, Command{Kind: Add, Candidate: candidate(name, time.Minute)}).ID
+		do(t, owner, Command{Kind: Dismiss, ID: id})
+		ids = append(ids, id)
+	}
+
+	do(t, owner, Command{Kind: HistoryRemove, IDs: []uint32{ids[0], ids[2]}})
+
+	var removed []uint32
+	for _, event := range sink.Events() {
+		if event.Delta != nil && event.Delta.Kind == protocol.DeltaHistoryRemoved {
+			removed = append(removed, event.Delta.ID)
+		}
+	}
+	if !slices.Equal(removed, []uint32{ids[0], ids[2]}) {
+		t.Fatalf("deltas = %v, want %v", removed, []uint32{ids[0], ids[2]})
 	}
 }
 

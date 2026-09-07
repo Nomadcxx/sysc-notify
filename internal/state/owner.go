@@ -63,6 +63,7 @@ const (
 	PresenterLost
 	DismissAll
 	HistoryClear
+	HistoryRemove
 	HistoryMarkSeen
 )
 
@@ -260,6 +261,8 @@ func (s *ownerState) do(command Command) (Result, error) {
 		return Result{}, result
 	case HistoryClear:
 		return Result{}, s.clearHistory()
+	case HistoryRemove:
+		return Result{}, s.removeHistory(command.IDs)
 	case HistoryMarkSeen:
 		return Result{}, s.markHistorySeen(command.IDs)
 	default:
@@ -401,6 +404,20 @@ func (s *ownerState) clearHistory() error {
 	}
 	if len(removed) != 0 {
 		s.publishDelta(protocol.Delta{Kind: protocol.DeltaHistoryCleared})
+	}
+	return nil
+}
+
+func (s *ownerState) removeHistory(ids []uint32) error {
+	if s.history == nil {
+		return errors.New("state: history unavailable")
+	}
+	removed, err := s.history.Remove(ids)
+	if err != nil {
+		return err
+	}
+	for _, id := range removed {
+		s.publishDelta(protocol.Delta{Kind: protocol.DeltaHistoryRemoved, ID: id})
 	}
 	return nil
 }
