@@ -205,6 +205,8 @@ func executeCommand(owner *state.Owner, generation uint64, command protocol.Comm
 		stateCommand.Kind = state.SubmitReply
 	case protocol.CommandHistoryClear:
 		stateCommand.Kind = state.HistoryClear
+	case protocol.CommandHistoryRemove:
+		stateCommand.Kind = state.HistoryRemove
 	case protocol.CommandHistoryMarkSeen:
 		stateCommand.Kind = state.HistoryMarkSeen
 	case protocol.CommandDismissAll:

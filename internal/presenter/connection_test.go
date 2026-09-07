@@ -137,6 +137,25 @@ func TestMalformedMessagesAndSequenceGapsReconnectCleanly(t *testing.T) {
 	_ = reconnected.conn.Close()
 }
 
+func TestExecuteHistoryRemoveReachesState(t *testing.T) {
+	clock := newPresenterClock()
+	store, err := history.OpenAt(t.TempDir(), clock.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := startHistoryHarness(t, clock, store)
+	id := addCandidate(t, h.owner, "gone", time.Minute)
+	doState(t, h.owner, state.Command{Kind: state.Dismiss, ID: id})
+
+	reply := executeCommand(h.owner, 0, protocol.Command{
+		Kind: protocol.CommandHistoryRemove,
+		IDs:  []uint32{id},
+	})
+	if !reply.OK {
+		t.Fatalf("reply = %+v, want OK", reply)
+	}
+}
+
 func TestDisconnectAndReplacementReleasePresentationLease(t *testing.T) {
 	for name, release := range map[string]func(*testing.T, serverHarness, *net.UnixConn){
 		"disconnect": func(t *testing.T, h serverHarness, conn *net.UnixConn) {
