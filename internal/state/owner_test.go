@@ -38,6 +38,61 @@ func TestOwnerSequencesAddAndReplacement(t *testing.T) {
 	}
 }
 
+func TestOwnerProducerReplacesAndClosesWithoutHistory(t *testing.T) {
+	clock := newManualClock()
+	store, err := history.OpenAt(t.TempDir(), clock.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := newEventSink()
+	owner := StartWithHistory(clock, sink, store)
+	t.Cleanup(func() { _ = owner.Close() })
+
+	first := do(t, owner, Command{Kind: ProducerPublish, Producer: producerRequest(15)})
+	if first.ID == 0 || first.Replaced {
+		t.Fatalf("first producer result = %#v", first)
+	}
+	active := snapshot(t, owner)
+	if len(active.Active) != 1 || active.Active[0].ID != first.ID || active.Active[0].ExpireTimeoutMS != 0 || active.Active[0].Value == nil || *active.Active[0].Value != 15 {
+		t.Fatalf("producer snapshot = %#v", active)
+	}
+
+	replacement := producerRequest(10)
+	replaced := do(t, owner, Command{Kind: ProducerPublish, Producer: replacement})
+	if replaced.ID != first.ID || !replaced.Replaced {
+		t.Fatalf("replacement result = %#v, first = %#v", replaced, first)
+	}
+	if active := snapshot(t, owner); len(active.Active) != 1 || active.Active[0].Value == nil || *active.Active[0].Value != 10 {
+		t.Fatalf("replacement snapshot = %#v", active)
+	}
+
+	closed := do(t, owner, Command{Kind: ProducerClose, Producer: &protocol.ProducerRequest{Key: "sysc-shell:battery-low"}})
+	if closed.ID != first.ID || len(snapshot(t, owner).Active) != 0 || len(snapshot(t, owner).History) != 0 {
+		t.Fatalf("close result or snapshot = %#v", closed)
+	}
+	if got := do(t, owner, Command{Kind: ProducerClose, Producer: &protocol.ProducerRequest{Key: "sysc-shell:battery-low"}}); got.ID != 0 {
+		t.Fatalf("idempotent close result = %#v", got)
+	}
+
+	next := do(t, owner, Command{Kind: ProducerPublish, Producer: producerRequest(5)})
+	if next.ID == first.ID {
+		t.Fatalf("reused closed producer ID %d", next.ID)
+	}
+	if events := sink.Events(); !hasDelta(events, protocol.DeltaReplaced) || !hasDelta(events, protocol.DeltaClosed) {
+		t.Fatalf("producer deltas = %#v", events)
+	}
+}
+
+func TestOwnerProducerMappingIsRemovedByDismissal(t *testing.T) {
+	owner, _ := startTestOwner(t)
+	first := do(t, owner, Command{Kind: ProducerPublish, Producer: producerRequest(15)})
+	do(t, owner, Command{Kind: Dismiss, ID: first.ID})
+	next := do(t, owner, Command{Kind: ProducerPublish, Producer: producerRequest(14)})
+	if next.ID == first.ID || next.Replaced {
+		t.Fatalf("producer after dismissal = %#v, first = %#v", next, first)
+	}
+}
+
 func TestOwnerPersistsOnlyEligibleClosedHistory(t *testing.T) {
 	clock := newManualClock()
 	stateHome := t.TempDir()
@@ -321,6 +376,22 @@ func hasID(snapshot protocol.Snapshot, id uint32) bool {
 func historyHasID(snapshot protocol.Snapshot, id uint32) bool {
 	for _, record := range snapshot.History {
 		if record.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func producerRequest(value int32) *protocol.ProducerRequest {
+	return &protocol.ProducerRequest{
+		Key: "sysc-shell:battery-low", AppName: "sysc-shell", Summary: "Battery low",
+		Body: "Battery is low.", Urgency: protocol.UrgencyCritical, Value: &value,
+	}
+}
+
+func hasDelta(events []Event, kind protocol.DeltaKind) bool {
+	for _, event := range events {
+		if event.Delta != nil && event.Delta.Kind == kind {
 			return true
 		}
 	}

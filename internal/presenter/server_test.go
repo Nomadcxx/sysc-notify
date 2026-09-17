@@ -123,6 +123,70 @@ func TestPresenterRequiresLifetimeCapability(t *testing.T) {
 	}
 }
 
+func TestProducerCapabilityAuthorizesKeyedCommands(t *testing.T) {
+	h := startServerHarness(t, nil)
+	client := connectPresenterWithHello(t, h.server.SocketPath(), helloWithProducer())
+	defer client.conn.Close()
+	if !hasCapability(client.hello.Capabilities, protocol.CapabilityBatteryProducer) {
+		t.Fatalf("service capabilities = %#v", client.hello.Capabilities)
+	}
+
+	value := int32(15)
+	command := protocol.Command{Kind: protocol.CommandProducerPublish, Producer: &protocol.ProducerRequest{
+		Key: "sysc-shell:battery-low", AppName: "sysc-shell", Summary: "Battery low",
+		Body: "Battery is at 15%.", Urgency: protocol.UrgencyCritical, Value: &value,
+	}}
+	if err := writeEnvelope(client.conn, protocol.KindCommand, 1, 0, command); err != nil {
+		t.Fatal(err)
+	}
+	first := readReply(t, client.conn, 1)
+	if !first.OK || first.ID == 0 || first.Replaced {
+		t.Fatalf("first producer reply = %#v", first)
+	}
+
+	value = 10
+	if err := writeEnvelope(client.conn, protocol.KindCommand, 2, 0, command); err != nil {
+		t.Fatal(err)
+	}
+	replacement := readReply(t, client.conn, 2)
+	if !replacement.OK || replacement.ID != first.ID || !replacement.Replaced {
+		t.Fatalf("replacement producer reply = %#v", replacement)
+	}
+
+	if err := writeEnvelope(client.conn, protocol.KindCommand, 3, 0, protocol.Command{
+		Kind:     protocol.CommandProducerClose,
+		Producer: &protocol.ProducerRequest{Key: "sysc-shell:battery-low"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	closed := readReply(t, client.conn, 3)
+	if !closed.OK || closed.ID != first.ID {
+		t.Fatalf("producer close reply = %#v", closed)
+	}
+	if got := snapshotOwner(t, h.owner); len(got.Active) != 0 {
+		t.Fatalf("producer close snapshot = %#v", got)
+	}
+}
+
+func TestProducerCommandRequiresNegotiatedCapability(t *testing.T) {
+	h := startServerHarness(t, nil)
+	client := connectPresenter(t, h.server.SocketPath())
+	defer client.conn.Close()
+	if err := writeEnvelope(client.conn, protocol.KindCommand, 1, 0, protocol.Command{
+		Kind:     protocol.CommandProducerPublish,
+		Producer: &protocol.ProducerRequest{Key: "sysc-shell:battery-low", Summary: "Battery low"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reply := readReply(t, client.conn, 1)
+	if reply.OK || reply.Error == nil || reply.Error.Code != protocol.ErrorUnavailable {
+		t.Fatalf("unauthorized producer reply = %#v", reply)
+	}
+	if got := snapshotOwner(t, h.owner); len(got.Active) != 0 {
+		t.Fatalf("unauthorized producer mutated state = %#v", got)
+	}
+}
+
 func TestPresentationRenewReturnsAuthoritativeLifetimes(t *testing.T) {
 	clock := newPresenterClock()
 	h := startServerHarness(t, clock)
@@ -203,26 +267,31 @@ func privateTempDir(t *testing.T) string {
 
 type presenterClient struct {
 	conn     *net.UnixConn
+	hello    protocol.Hello
 	snapshot protocol.Snapshot
 }
 
 func connectPresenter(t *testing.T, path string) presenterClient {
+	return connectPresenterWithHello(t, path, validHello())
+}
+
+func connectPresenterWithHello(t *testing.T, path string, clientHello protocol.Hello) presenterClient {
 	t.Helper()
 	conn := dialSocket(t, path)
-	if err := writeEnvelope(conn, protocol.KindHello, 0, 0, validHello()); err != nil {
+	if err := writeEnvelope(conn, protocol.KindHello, 0, 0, clientHello); err != nil {
 		t.Fatal(err)
 	}
 	serverHelloEnvelope := readEnvelope(t, conn)
 	if serverHelloEnvelope.Kind != protocol.KindHello {
 		t.Fatalf("first server message = %#v", serverHelloEnvelope)
 	}
-	var hello protocol.Hello
-	decodePayload(t, serverHelloEnvelope, &hello)
-	if err := hello.Validate(protocol.RolePresenter); err != nil {
+	var serviceHello protocol.Hello
+	decodePayload(t, serverHelloEnvelope, &serviceHello)
+	if err := serviceHello.Validate(protocol.RolePresenter); err != nil {
 		t.Fatal(err)
 	}
-	if !hasCapability(hello.Capabilities, RequiredLifetimeCapability) {
-		t.Fatalf("service capabilities = %#v", hello.Capabilities)
+	if !hasCapability(serviceHello.Capabilities, RequiredLifetimeCapability) {
+		t.Fatalf("service capabilities = %#v", serviceHello.Capabilities)
 	}
 	snapshotEnvelope := readEnvelope(t, conn)
 	if snapshotEnvelope.Kind != protocol.KindSnapshot {
@@ -233,7 +302,7 @@ func connectPresenter(t *testing.T, path string) presenterClient {
 	if snapshot.Sequence != snapshotEnvelope.Sequence {
 		t.Fatalf("snapshot sequence %d != envelope %d", snapshot.Sequence, snapshotEnvelope.Sequence)
 	}
-	return presenterClient{conn: conn, snapshot: snapshot}
+	return presenterClient{conn: conn, hello: serviceHello, snapshot: snapshot}
 }
 
 func validHello() protocol.Hello {
@@ -241,6 +310,12 @@ func validHello() protocol.Hello {
 		Major: protocol.ProtocolMajor, Minor: protocol.ProtocolMinor, Role: protocol.RolePresenter,
 		Capabilities: []string{RequiredCapability, RequiredLifetimeCapability},
 	}
+}
+
+func helloWithProducer() protocol.Hello {
+	hello := validHello()
+	hello.Capabilities = append(hello.Capabilities, protocol.CapabilityBatteryProducer)
+	return hello
 }
 
 func dialSocket(t *testing.T, path string) *net.UnixConn {
@@ -307,4 +382,13 @@ func addCandidate(t *testing.T, owner *state.Owner, summary string, timeout time
 		t.Fatal(err)
 	}
 	return result.ID
+}
+
+func snapshotOwner(t *testing.T, owner *state.Owner) protocol.Snapshot {
+	t.Helper()
+	snapshot, err := owner.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
 }

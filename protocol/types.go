@@ -7,9 +7,10 @@ import (
 
 const (
 	ProtocolMajor uint16 = 1
-	ProtocolMinor uint16 = 1
+	ProtocolMinor uint16 = 2
 
-	RolePresenter = "presenter"
+	RolePresenter             = "presenter"
+	CapabilityBatteryProducer = "battery-producer"
 
 	MaxActiveNotifications    = 128
 	MaxBodyBytes              = 16 << 10
@@ -24,6 +25,7 @@ const (
 	MaxPresenterQueueMessages = 256
 	MaxPresenterDecodedBytes  = 32 << 20
 	MaxCommandQueue           = 64
+	MaxProducerKeyBytes       = 128
 )
 
 const HistoryRetention = 7 * 24 * time.Hour
@@ -186,15 +188,28 @@ const (
 	CommandHistoryRemove     CommandKind = "history.remove"
 	CommandHistoryMarkSeen   CommandKind = "history.mark-seen"
 	CommandDismissAll        CommandKind = "active.dismiss-all"
+	CommandProducerPublish   CommandKind = "producer.publish"
+	CommandProducerClose     CommandKind = "producer.close"
 )
 
+type ProducerRequest struct {
+	Key             string  `json:"key"`
+	AppName         string  `json:"app_name,omitempty"`
+	Summary         string  `json:"summary,omitempty"`
+	Body            string  `json:"body,omitempty"`
+	Urgency         Urgency `json:"urgency"`
+	ExpireTimeoutMS int32   `json:"expire_timeout_ms"`
+	Value           *int32  `json:"value,omitempty"`
+}
+
 type Command struct {
-	Kind          CommandKind    `json:"kind"`
-	ID            uint32         `json:"id,omitempty"`
-	IDs           []uint32       `json:"ids,omitempty"`
-	ActionKey     string         `json:"action_key,omitempty"`
-	Text          string         `json:"text,omitempty"`
-	Presentations []Presentation `json:"presentations,omitempty"`
+	Kind          CommandKind      `json:"kind"`
+	ID            uint32           `json:"id,omitempty"`
+	IDs           []uint32         `json:"ids,omitempty"`
+	ActionKey     string           `json:"action_key,omitempty"`
+	Text          string           `json:"text,omitempty"`
+	Presentations []Presentation   `json:"presentations,omitempty"`
+	Producer      *ProducerRequest `json:"producer,omitempty"`
 }
 
 type ErrorCode string
@@ -216,4 +231,6 @@ type Reply struct {
 	OK        bool           `json:"ok"`
 	Error     *ProtocolError `json:"error,omitempty"`
 	Lifetimes []Lifetime     `json:"lifetimes,omitempty"`
+	ID        uint32         `json:"id,omitempty"`
+	Replaced  bool           `json:"replaced,omitempty"`
 }

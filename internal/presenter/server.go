@@ -191,6 +191,7 @@ func (s *Server) handle(socket *net.UnixConn) {
 	if err := socket.SetDeadline(time.Time{}); err != nil {
 		return
 	}
+	c.producer = hasCapability(hello.Capabilities, protocol.CapabilityBatteryProducer)
 
 	s.mu.Lock()
 	if s.preparing != nil {
@@ -212,7 +213,7 @@ func (s *Server) handle(socket *net.UnixConn) {
 	}
 	serviceHello := protocol.Hello{
 		Major: protocol.ProtocolMajor, Minor: protocol.ProtocolMinor, Role: protocol.RolePresenter,
-		Capabilities: []string{RequiredCapability, RequiredLifetimeCapability, "actions", "history", "inline-reply"},
+		Capabilities: []string{RequiredCapability, RequiredLifetimeCapability, protocol.CapabilityBatteryProducer, "actions", "history", "inline-reply"},
 	}
 	helloFrame, err := marshalEnvelope(protocol.KindHello, 0, 0, serviceHello)
 	if err != nil {

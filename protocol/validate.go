@@ -46,6 +46,9 @@ func (h Hello) Validate(role string) error {
 	if h.Major != ProtocolMajor {
 		return fmt.Errorf("protocol: incompatible major %d", h.Major)
 	}
+	if h.Minor > ProtocolMinor {
+		return fmt.Errorf("protocol: unsupported minor %d", h.Minor)
+	}
 	if h.Role != role {
 		return fmt.Errorf("protocol: unexpected role %q", h.Role)
 	}
@@ -161,6 +164,29 @@ func (a Action) Validate() error {
 	return validateText("action label", a.Label, MaxBodyBytes, false)
 }
 
+func (p ProducerRequest) Validate() error {
+	if err := validateText("producer key", p.Key, MaxProducerKeyBytes, false); err != nil {
+		return err
+	}
+	for name, value := range map[string]string{
+		"producer app name": p.AppName, "producer summary": p.Summary, "producer body": p.Body,
+	} {
+		if err := validateText(name, value, MaxBodyBytes, true); err != nil {
+			return err
+		}
+	}
+	if !p.Urgency.valid() {
+		return fmt.Errorf("protocol: invalid producer urgency %d", p.Urgency)
+	}
+	if p.ExpireTimeoutMS < -1 {
+		return errors.New("protocol: invalid producer expiry timeout")
+	}
+	if p.Value != nil && (*p.Value < 0 || *p.Value > 100) {
+		return errors.New("protocol: producer value is outside 0..100")
+	}
+	return nil
+}
+
 func (i Image) Validate() error {
 	if i.MediaType != "image/png" {
 		return fmt.Errorf("protocol: unsupported image media type %q", i.MediaType)
@@ -265,6 +291,11 @@ func (c Command) Validate() error {
 		return nil
 	case CommandHistoryRemove, CommandHistoryMarkSeen:
 		return validateIDs(c.IDs, MaxHistoryEntries)
+	case CommandProducerPublish, CommandProducerClose:
+		if c.Producer == nil {
+			return errors.New("protocol: producer command has no payload")
+		}
+		return c.Producer.Validate()
 	default:
 		return fmt.Errorf("protocol: invalid command kind %q", c.Kind)
 	}

@@ -65,11 +65,14 @@ const (
 	HistoryClear
 	HistoryRemove
 	HistoryMarkSeen
+	ProducerPublish
+	ProducerClose
 )
 
 type Command struct {
 	Kind          CommandKind
 	Candidate     notify.Candidate
+	Producer      *protocol.ProducerRequest
 	ID            uint32
 	ActionKey     string
 	ReplyText     string
@@ -175,6 +178,7 @@ func (o *Owner) run(clock Clock, sink Sink, store *history.Store) {
 	defer close(o.done)
 	state := ownerState{
 		clock: clock, sink: sink, history: store, records: make(map[uint32]*record), nextID: 1,
+		producerIDs: make(map[string]uint32),
 	}
 	if store != nil {
 		state.nextHistorySweep = clock.Now().Add(HistorySweep)
@@ -205,6 +209,7 @@ func (o *Owner) run(clock Clock, sink Sink, store *history.Store) {
 type record struct {
 	notification protocol.Notification
 	candidate    notify.Candidate
+	producerKey  string
 	duration     time.Duration
 	state        protocol.PresentationState
 	displayed    bool
@@ -218,10 +223,11 @@ type ownerState struct {
 	sink    Sink
 	history *history.Store
 
-	records  map[uint32]*record
-	order    []uint32
-	nextID   uint32
-	sequence uint64
+	records     map[uint32]*record
+	producerIDs map[string]uint32
+	order       []uint32
+	nextID      uint32
+	sequence    uint64
 
 	presenterGeneration uint64
 	leaseDeadline       time.Time
@@ -235,6 +241,10 @@ func (s *ownerState) do(command Command) (Result, error) {
 	switch command.Kind {
 	case Add:
 		return s.add(command.Candidate, now)
+	case ProducerPublish:
+		return s.publishProducer(command.Producer, now)
+	case ProducerClose:
+		return s.closeProducer(command.Producer)
 	case CloseRequested:
 		return Result{}, s.close(command.ID, protocol.CloseRequested)
 	case Dismiss:
@@ -271,6 +281,10 @@ func (s *ownerState) do(command Command) (Result, error) {
 }
 
 func (s *ownerState) add(candidate notify.Candidate, now time.Time) (Result, error) {
+	return s.addWithProducerKey(candidate, "", now)
+}
+
+func (s *ownerState) addWithProducerKey(candidate notify.Candidate, producerKey string, now time.Time) (Result, error) {
 	if err := validateCandidate(candidate, now); err != nil {
 		return Result{}, err
 	}
@@ -295,13 +309,18 @@ func (s *ownerState) add(candidate notify.Candidate, now time.Time) (Result, err
 	record := &record{
 		notification: notification,
 		candidate:    candidate,
+		producerKey:  producerKey,
 		duration:     duration,
 		state:        protocol.PresentationSuppressed,
 		remaining:    duration,
 	}
 	if replaced {
+		if existing.producerKey != "" && existing.producerKey != producerKey && s.producerIDs[existing.producerKey] == id {
+			delete(s.producerIDs, existing.producerKey)
+		}
 		record.state = existing.state
 		record.displayed = existing.displayed
+		record.producerKey = producerKey
 		if duration > 0 {
 			switch record.state {
 			case protocol.PresentationQueued, protocol.PresentationHovered:
@@ -323,6 +342,58 @@ func (s *ownerState) add(candidate notify.Candidate, now time.Time) (Result, err
 	s.order = append(s.order, id)
 	lifetime := s.lifetime(record, now)
 	s.publishDelta(protocol.Delta{Kind: protocol.DeltaAdded, Notification: cloneNotificationPointer(notification), Lifetime: &lifetime})
+	return Result{ID: id}, nil
+}
+
+func (s *ownerState) publishProducer(request *protocol.ProducerRequest, now time.Time) (Result, error) {
+	if request == nil {
+		return Result{}, errors.New("state: missing producer request")
+	}
+	if err := request.Validate(); err != nil {
+		return Result{}, err
+	}
+	if s.producerIDs == nil {
+		s.producerIDs = make(map[string]uint32)
+	}
+	replacesID := s.producerIDs[request.Key]
+	if replacesID != 0 {
+		if _, exists := s.records[replacesID]; !exists {
+			delete(s.producerIDs, request.Key)
+			replacesID = 0
+		}
+	}
+	value := cloneInt32(request.Value)
+	candidate := notify.Candidate{
+		AppName: request.AppName, Summary: request.Summary, Body: request.Body,
+		ReplacesID: replacesID, Urgency: request.Urgency, ExpireTimeout: request.ExpireTimeoutMS,
+		Transient: true, Value: value,
+	}
+	result, err := s.addWithProducerKey(candidate, request.Key, now)
+	if err != nil {
+		return Result{}, err
+	}
+	s.producerIDs[request.Key] = result.ID
+	return result, nil
+}
+
+func (s *ownerState) closeProducer(request *protocol.ProducerRequest) (Result, error) {
+	if request == nil {
+		return Result{}, errors.New("state: missing producer request")
+	}
+	if err := request.Validate(); err != nil {
+		return Result{}, err
+	}
+	id := s.producerIDs[request.Key]
+	if id == 0 {
+		return Result{}, nil
+	}
+	if _, exists := s.records[id]; !exists {
+		delete(s.producerIDs, request.Key)
+		return Result{}, nil
+	}
+	if err := s.close(id, protocol.CloseRequested); err != nil {
+		return Result{ID: id}, err
+	}
 	return Result{ID: id}, nil
 }
 
@@ -363,6 +434,9 @@ func (s *ownerState) close(id uint32, reason protocol.CloseReason) error {
 		return ErrNotFound
 	}
 	delete(s.records, id)
+	if record.producerKey != "" && s.producerIDs[record.producerKey] == id {
+		delete(s.producerIDs, record.producerKey)
+	}
 	for i, orderedID := range s.order {
 		if orderedID == id {
 			s.order = append(s.order[:i], s.order[i+1:]...)

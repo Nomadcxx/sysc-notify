@@ -86,6 +86,61 @@ func TestHelloValidation(t *testing.T) {
 	}
 }
 
+func TestProducerCommandsAndRepliesRoundTrip(t *testing.T) {
+	value := int32(15)
+	commands := []Command{
+		{Kind: CommandProducerPublish, Producer: &ProducerRequest{
+			Key: "sysc-shell:battery-low", AppName: "sysc-shell", Summary: "Battery low",
+			Body: "Battery is at 15%.", Urgency: UrgencyCritical, Value: &value,
+		}},
+		{Kind: CommandProducerClose, Producer: &ProducerRequest{Key: "sysc-shell:battery-low"}},
+	}
+	for _, want := range commands {
+		data, err := json.Marshal(want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got Command
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if err := got.Validate(); err != nil {
+			t.Fatalf("%q Validate() = %v", got.Kind, err)
+		}
+		if got.Kind != want.Kind || got.Producer == nil || got.Producer.Key != want.Producer.Key {
+			t.Fatalf("round-trip command = %#v, want %#v", got, want)
+		}
+	}
+
+	reply := Reply{OK: true, ID: 42, Replaced: true}
+	if err := reply.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Reply
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != reply.ID || !got.Replaced {
+		t.Fatalf("round-trip reply = %#v", got)
+	}
+}
+
+func TestHelloMinorCompatibility(t *testing.T) {
+	older := Hello{Major: ProtocolMajor, Minor: ProtocolMinor - 1, Role: RolePresenter}
+	if err := older.Validate(RolePresenter); err != nil {
+		t.Fatalf("older minor rejected: %v", err)
+	}
+	future := older
+	future.Minor = ProtocolMinor + 1
+	if err := future.Validate(RolePresenter); err == nil {
+		t.Fatal("future minor accepted")
+	}
+}
+
 func TestEnvelopeValidation(t *testing.T) {
 	for _, envelope := range []Envelope{
 		{Kind: KindHello, Payload: json.RawMessage(`{}`)},

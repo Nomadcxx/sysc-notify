@@ -19,6 +19,7 @@ type outbound struct {
 type connection struct {
 	socket     *net.UnixConn
 	generation uint64
+	producer   bool
 
 	mu             sync.Mutex
 	queue          chan outbound
@@ -182,7 +183,7 @@ func (c *connection) readLoop(owner *state.Owner) {
 			return
 		}
 		c.lastRequestID = envelope.RequestID
-		reply := executeCommand(owner, c.generation, command)
+		reply := executeCommandForConnection(owner, c.generation, c.producer, command)
 		payload, err := marshalEnvelope(protocol.KindReply, envelope.RequestID, 0, reply)
 		if err != nil || !c.enqueue(outbound{data: payload}) {
 			return
@@ -191,6 +192,13 @@ func (c *connection) readLoop(owner *state.Owner) {
 }
 
 func executeCommand(owner *state.Owner, generation uint64, command protocol.Command) protocol.Reply {
+	return executeCommandForConnection(owner, generation, false, command)
+}
+
+func executeCommandForConnection(owner *state.Owner, generation uint64, producer bool, command protocol.Command) protocol.Reply {
+	if (command.Kind == protocol.CommandProducerPublish || command.Kind == protocol.CommandProducerClose) && !producer {
+		return protocol.Reply{Error: &protocol.ProtocolError{Code: protocol.ErrorUnavailable, Message: "producer capability was not negotiated"}}
+	}
 	stateCommand := state.Command{ID: command.ID, ActionKey: command.ActionKey, ReplyText: command.Text, IDs: append([]uint32(nil), command.IDs...)}
 	switch command.Kind {
 	case protocol.CommandPresentationRenew:
@@ -211,10 +219,16 @@ func executeCommand(owner *state.Owner, generation uint64, command protocol.Comm
 		stateCommand.Kind = state.HistoryMarkSeen
 	case protocol.CommandDismissAll:
 		stateCommand.Kind = state.DismissAll
+	case protocol.CommandProducerPublish:
+		stateCommand.Kind = state.ProducerPublish
+		stateCommand.Producer = command.Producer
+	case protocol.CommandProducerClose:
+		stateCommand.Kind = state.ProducerClose
+		stateCommand.Producer = command.Producer
 	}
 	result, err := owner.Do(context.Background(), stateCommand)
 	if err == nil {
-		return protocol.Reply{OK: true, Lifetimes: result.Lifetimes}
+		return protocol.Reply{OK: true, ID: result.ID, Replaced: result.Replaced, Lifetimes: result.Lifetimes}
 	}
 	code := protocol.ErrorInvalid
 	if errors.Is(err, state.ErrNotFound) {
