@@ -12,6 +12,7 @@ const (
 	HintResident               = "resident"
 	HintInlineReplyPlaceholder = "x-kde-reply-placeholder-text"
 	HintImageData              = "image-data"
+	HintImagePath              = "image-path"
 )
 
 type Sender struct {

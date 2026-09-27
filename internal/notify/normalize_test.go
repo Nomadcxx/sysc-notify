@@ -70,6 +70,49 @@ func TestNormalizeFields(t *testing.T) {
 	}
 }
 
+func TestNormalizeImagePathFallback(t *testing.T) {
+	const path = "/usr/share/icons/hicolor/48x48/apps/example.png"
+	got, err := Normalize(Request{Hints: map[string]any{"image-path": path}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AppIcon != path {
+		t.Fatalf("AppIcon = %q, want image-path %q", got.AppIcon, path)
+	}
+}
+
+func TestNormalizeImagePathRequiresAbsolutePath(t *testing.T) {
+	got, err := Normalize(Request{Hints: map[string]any{"image-path": "icons/example.png"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AppIcon != "" || !got.ImageRejected {
+		t.Fatalf("relative image-path was accepted: %#v", got)
+	}
+}
+
+func TestNormalizeImagePathDoesNotReplaceAppIcon(t *testing.T) {
+	const path = "/usr/share/icons/hicolor/48x48/apps/example.png"
+	got, err := Normalize(Request{AppIcon: "preferred", Hints: map[string]any{"image-path": path}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AppIcon != "preferred" {
+		t.Fatalf("AppIcon = %q, want preferred", got.AppIcon)
+	}
+}
+
+func TestNormalizeBoundsIgnoredImagePath(t *testing.T) {
+	path := strings.Repeat("x", protocol.MaxBodyBytes+1)
+	got, err := Normalize(Request{AppIcon: "preferred", Hints: map[string]any{"image-path": path}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AppIcon != "preferred" || !got.ImageRejected {
+		t.Fatalf("invalid ignored image-path changed normalization: %#v", got)
+	}
+}
+
 func TestNormalizeRejectsStructuralBounds(t *testing.T) {
 	tests := map[string]Request{
 		"odd actions":   {Summary: "ok", Actions: []string{"key"}},

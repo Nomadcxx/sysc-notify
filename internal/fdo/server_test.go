@@ -75,8 +75,8 @@ func TestServerMetadataAndNotifyReplacement(t *testing.T) {
 	if err := h.object.Call(Interface+".GetCapabilities", 0).Store(&capabilities); err != nil {
 		t.Fatal(err)
 	}
-	if len(capabilities) != 0 {
-		t.Fatalf("unqualified capabilities = %v", capabilities)
+	if !reflect.DeepEqual(capabilities, []string{"actions", "body", "body-markup", "inline-reply", "persistence"}) {
+		t.Fatalf("capabilities = %v, want [actions body body-markup inline-reply persistence]", capabilities)
 	}
 
 	first := sendNotify(t, h.object, 0, "first", nil, -1)
@@ -133,6 +133,39 @@ func TestServerConvertsImageDataOverDBus(t *testing.T) {
 	if len(snapshot.Active) != 1 || snapshot.Active[0].ID != id || snapshot.Active[0].Image == nil ||
 		snapshot.Active[0].Image.Width != 2 || snapshot.Active[0].Image.Height != 1 {
 		t.Fatalf("converted image snapshot = %#v", snapshot.Active)
+	}
+}
+
+func TestServerConvertsLegacyImageDataAliasesOverDBus(t *testing.T) {
+	for _, key := range []string{"image_data", "icon_data"} {
+		t.Run(key, func(t *testing.T) {
+			h := startHarness(t, nil)
+			id := sendNotify(t, h.object, 0, "image", map[string]dbus.Variant{
+				key: dbus.MakeVariant(imageData{Width: 1, Height: 1, RowStride: 4, HasAlpha: true, BitsPerSample: 8, Channels: 4, Data: []byte{0xff, 0, 0, 0xff}}),
+			}, 0)
+			snapshot, err := h.owner.Snapshot(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(snapshot.Active) != 1 || snapshot.Active[0].ID != id || snapshot.Active[0].Image == nil {
+				t.Fatalf("converted %s snapshot = %#v", key, snapshot.Active)
+			}
+		})
+	}
+}
+
+func TestServerConvertsImagePathHintOverDBus(t *testing.T) {
+	const path = "/usr/share/icons/hicolor/48x48/apps/example.png"
+	h := startHarness(t, nil)
+	id := sendNotify(t, h.object, 0, "image path", map[string]dbus.Variant{
+		"image-path": dbus.MakeVariant(path),
+	}, 0)
+	snapshot, err := h.owner.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Active) != 1 || snapshot.Active[0].ID != id || snapshot.Active[0].AppIcon != path {
+		t.Fatalf("converted image-path snapshot = %#v", snapshot.Active)
 	}
 }
 

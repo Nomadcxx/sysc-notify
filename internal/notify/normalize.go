@@ -3,6 +3,7 @@ package notify
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"unicode/utf8"
 
 	"github.com/Nomadcxx/sysc-notify/protocol"
@@ -119,6 +120,25 @@ func Normalize(request Request) (Candidate, error) {
 				continue
 			}
 			candidate.Image = image
+		case HintImagePath:
+			path, ok := value.(string)
+			if !ok {
+				candidate.ImageRejected = true
+				continue
+			}
+			if validateString("image path", path, true) != nil {
+				candidate.ImageRejected = true
+				continue
+			}
+			if path == "" || candidate.AppIcon != "" {
+				continue
+			}
+			if !filepath.IsAbs(path) {
+				candidate.ImageRejected = true
+				continue
+			}
+			// ponytail: reuse app_icon's absolute-path contract; add a distinct wire field only if consumers need source-specific precedence.
+			candidate.AppIcon = path
 		}
 	}
 	return candidate, nil

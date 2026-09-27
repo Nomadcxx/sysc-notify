@@ -20,23 +20,47 @@ type imageData struct {
 	Data          []byte
 }
 
+const (
+	legacyImageData = "image_data"
+	legacyIconData  = "icon_data"
+)
+
 func convertHints(source map[string]dbus.Variant) (map[string]any, error) {
 	if len(source) > protocol.MaxHints {
 		return nil, errors.New("fdo: too many hints")
 	}
 	result := make(map[string]any, len(source))
+	var rawImage any
+	imagePriority := 3
 	for key, variant := range source {
 		switch key {
 		case notify.HintUrgency, notify.HintTransient, notify.HintPrivate, notify.HintResident,
 			notify.HintDesktopEntry, notify.HintCategory, notify.HintValue, notify.HintInlineReplyPlaceholder:
 			result[key] = variant.Value()
-		case notify.HintImageData:
-			image, err := convertImageData(variant.Value())
-			if err != nil {
-				return nil, err
+		case notify.HintImageData, legacyImageData, legacyIconData:
+			priority := 2
+			if key == notify.HintImageData {
+				priority = 0
+			} else if key == legacyImageData {
+				priority = 1
 			}
-			result[key] = image
+			if priority < imagePriority {
+				rawImage, imagePriority = variant.Value(), priority
+			}
+		case notify.HintImagePath:
+			path, ok := variant.Value().(string)
+			if !ok {
+				return nil, errors.New("fdo: malformed image-path hint")
+			}
+			result[key] = path
 		}
+	}
+	if imagePriority < 3 {
+		image, err := convertImageData(rawImage)
+		if err != nil {
+			return nil, err
+		}
+		result[notify.HintImageData] = image
 	}
 	return result, nil
 }
