@@ -91,6 +91,41 @@ func TestNormalizeImagePathRequiresAbsolutePath(t *testing.T) {
 	}
 }
 
+// The spec lets image-path name an icon in the theme, and notify-send -i
+// sends it that way: a bare name is an icon name, not a relative path, so
+// it passes through for the shell to resolve.
+func TestNormalizeImagePathAcceptsAnIconName(t *testing.T) {
+	got, err := Normalize(Request{Hints: map[string]any{"image-path": "spotify"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AppIcon != "spotify" || got.ImageRejected {
+		t.Fatalf("icon name = %#v, want AppIcon spotify", got)
+	}
+}
+
+func TestNormalizeImagePathAcceptsAFileURI(t *testing.T) {
+	got, err := Normalize(Request{Hints: map[string]any{"image-path": "file:///usr/share/pixmaps/example%20icon.png"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AppIcon != "/usr/share/pixmaps/example icon.png" || got.ImageRejected {
+		t.Fatalf("file URI = %#v, want its absolute path", got)
+	}
+}
+
+func TestNormalizeImagePathRejectsWhatIsNeitherNameNorPath(t *testing.T) {
+	for _, path := range []string{".", "..", "file://relative/icon.png", "file:///", "https://example.com/icon.png", "icons/../x.png"} {
+		got, err := Normalize(Request{Hints: map[string]any{"image-path": path}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.AppIcon != "" || !got.ImageRejected {
+			t.Fatalf("%q was accepted: %#v", path, got)
+		}
+	}
+}
+
 func TestNormalizeImagePathDoesNotReplaceAppIcon(t *testing.T) {
 	const path = "/usr/share/icons/hicolor/48x48/apps/example.png"
 	got, err := Normalize(Request{AppIcon: "preferred", Hints: map[string]any{"image-path": path}})

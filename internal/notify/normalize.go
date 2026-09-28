@@ -3,7 +3,9 @@ package notify
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/Nomadcxx/sysc-notify/protocol"
@@ -133,15 +135,38 @@ func Normalize(request Request) (Candidate, error) {
 			if path == "" || candidate.AppIcon != "" {
 				continue
 			}
-			if !filepath.IsAbs(path) {
+			icon, ok := imagePathIcon(path)
+			if !ok {
 				candidate.ImageRejected = true
 				continue
 			}
-			// ponytail: reuse app_icon's absolute-path contract; add a distinct wire field only if consumers need source-specific precedence.
-			candidate.AppIcon = path
+			// ponytail: reuse app_icon's name-or-absolute-path contract; add a distinct wire field only if consumers need source-specific precedence.
+			candidate.AppIcon = icon
 		}
 	}
 	return candidate, nil
+}
+
+// imagePathIcon reads an image-path hint the way the spec defines it: a
+// file:// URI, an absolute path, or the name of an icon in the theme, which
+// is how notify-send -i sends it. A name carries no separator or scheme, so it
+// cannot point outside the theme; any other relative path, and any URI of
+// another scheme or host, is rejected.
+func imagePathIcon(hint string) (string, bool) {
+	if strings.HasPrefix(hint, "file://") {
+		u, err := url.Parse(hint)
+		if err != nil || (u.Host != "" && u.Host != "localhost") || !filepath.IsAbs(u.Path) || u.Path == "/" {
+			return "", false
+		}
+		return u.Path, true
+	}
+	if filepath.IsAbs(hint) {
+		return hint, true
+	}
+	if hint == "." || hint == ".." || strings.ContainsAny(hint, "/:") {
+		return "", false
+	}
+	return hint, true
 }
 
 func validateString(name, value string, emptyOK bool) error {
