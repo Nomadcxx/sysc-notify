@@ -1,0 +1,12 @@
+[Unit]
+Description=sysc notification service
+Documentation=https://github.com/Nomadcxx/sysc-notify
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/sysc-notify
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=default.target
