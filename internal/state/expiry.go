@@ -15,17 +15,14 @@ func (s *ownerState) renew(generation uint64, presentations []protocol.Presentat
 	if err := command.Validate(); err != nil {
 		return err
 	}
-	for _, presentation := range presentations {
-		if _, exists := s.records[presentation.ID]; !exists {
-			return ErrNotFound
-		}
-	}
 	if s.presenterGeneration != 0 && generation != s.presenterGeneration {
 		s.clearPresentation(now)
 	}
 	s.presenterGeneration = generation
 	s.leaseDeadline = now.Add(PresentationLease)
 
+	// The presenter's view can trail a close, so an id that is gone is skipped
+	// rather than failing the renew and starving the lease of the live ones.
 	states := make(map[uint32]protocol.PresentationState, len(presentations))
 	for _, presentation := range presentations {
 		states[presentation.ID] = presentation.State
@@ -78,9 +75,7 @@ func (s *ownerState) setPresentation(record *record, next protocol.PresentationS
 		record.deadline = now.Add(record.remaining)
 		record.hasDeadline = true
 	case protocol.PresentationSuppressed:
-		if record.remaining <= 0 {
-			record.remaining = record.duration
-		}
+		// A record past due keeps a zero remaining time and expires.
 		record.deadline = now.Add(record.remaining)
 		record.hasDeadline = true
 	}

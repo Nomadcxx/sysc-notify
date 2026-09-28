@@ -255,3 +255,44 @@ func TestOwnerDoHonorsCancelledContext(t *testing.T) {
 		t.Fatal("Do() ignored cancelled context")
 	}
 }
+
+func TestSuppressedAfterDeadlineExpiresInsteadOfRestarting(t *testing.T) {
+	clock, owner := startClockOwner(t)
+	id := do(t, owner, Command{Kind: Add, Candidate: candidate("late", 10*time.Second)}).ID
+	present(t, owner, 1, id, protocol.PresentationVisible)
+	// The renew wins the owner's select against the due timer.
+	clock.Jump(10 * time.Second)
+	present(t, owner, 1, id, protocol.PresentationHovered)
+	present(t, owner, 1, id, protocol.PresentationSuppressed)
+	clock.Advance(0)
+	waitForMissing(t, owner, id)
+}
+
+func TestRenewSkipsNotificationsThatAlreadyClosed(t *testing.T) {
+	clock, owner := startClockOwner(t)
+	kept := do(t, owner, Command{Kind: Add, Candidate: candidate("kept", 10*time.Second)}).ID
+	gone := do(t, owner, Command{Kind: Add, Candidate: candidate("gone", 10*time.Second)}).ID
+	do(t, owner, Command{Kind: Dismiss, ID: gone})
+	result := do(t, owner, Command{
+		Kind: PresentationRenew, Generation: 1,
+		Presentations: []protocol.Presentation{
+			{ID: kept, State: protocol.PresentationHovered},
+			{ID: gone, State: protocol.PresentationVisible},
+		},
+	})
+	if lifetime := lifetimeFor(t, result.Lifetimes, kept); lifetime.Running {
+		t.Fatalf("hovered lifetime = %#v, want paused", lifetime)
+	}
+	holdPresentation(t, clock, owner, 1, kept, protocol.PresentationHovered, time.Minute)
+	if !hasID(snapshot(t, owner), kept) {
+		t.Fatal("hover was not applied or lease starved")
+	}
+}
+
+// Jump moves the clock without firing timers, as when a request wins the
+// owner's select over a timer that is already due.
+func (c *manualClock) Jump(duration time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(duration)
+}
