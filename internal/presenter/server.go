@@ -2,6 +2,7 @@ package presenter
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -219,7 +220,7 @@ func (s *Server) handle(socket *net.UnixConn) {
 	if err != nil {
 		return
 	}
-	snapshotFrame, err := marshalEnvelope(protocol.KindSnapshot, 0, snapshot.Sequence, snapshot)
+	snapshotFrame, err := marshalSnapshot(snapshot)
 	if err != nil {
 		return
 	}
@@ -430,4 +431,39 @@ func hasCapability(capabilities []string, required string) bool {
 		}
 	}
 	return false
+}
+
+// marshalSnapshot frames the handshake snapshot within MaxFrameSize. Each
+// record may carry a wire image, and together they can outgrow one frame, so
+// images are dropped oldest first, active before history, until it fits. The
+// records still arrive; the shell shows those without their image.
+func marshalSnapshot(snapshot protocol.Snapshot) ([]byte, error) {
+	frame, err := marshalEnvelope(protocol.KindSnapshot, 0, snapshot.Sequence, snapshot)
+	if err != nil || len(frame) <= int(protocol.MaxFrameSize) {
+		return frame, err
+	}
+	images := make([]**protocol.Image, 0, len(snapshot.Active)+len(snapshot.History))
+	for i := range snapshot.Active {
+		if snapshot.Active[i].Image != nil {
+			images = append(images, &snapshot.Active[i].Image)
+		}
+	}
+	for i := range snapshot.History {
+		if snapshot.History[i].Image != nil {
+			images = append(images, &snapshot.History[i].Image)
+		}
+	}
+	for len(frame) > int(protocol.MaxFrameSize) && len(images) > 0 {
+		for excess := len(frame) - int(protocol.MaxFrameSize); excess > 0 && len(images) > 0; images = images[1:] {
+			excess -= base64.StdEncoding.EncodedLen(len((*images[0]).Data))
+			*images[0] = nil
+		}
+		if frame, err = marshalEnvelope(protocol.KindSnapshot, 0, snapshot.Sequence, snapshot); err != nil {
+			return nil, err
+		}
+	}
+	if len(frame) > int(protocol.MaxFrameSize) {
+		return nil, errors.New("presenter: snapshot exceeds frame size without images")
+	}
+	return frame, nil
 }

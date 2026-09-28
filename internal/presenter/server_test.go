@@ -341,7 +341,7 @@ func writeEnvelope(conn net.Conn, kind string, requestID, sequence uint64, paylo
 
 func readEnvelope(t *testing.T, conn net.Conn) protocol.Envelope {
 	t.Helper()
-	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(handshakeTimeout)); err != nil {
 		t.Fatal(err)
 	}
 	frame, err := protocol.ReadFrame(conn)
@@ -391,4 +391,39 @@ func snapshotOwner(t *testing.T, owner *state.Owner) protocol.Snapshot {
 		t.Fatal(err)
 	}
 	return snapshot
+}
+
+func TestSnapshotWithManyWireImagesStillHandshakes(t *testing.T) {
+	h := startServerHarness(t, nil)
+	const count = 16
+	ids := make([]uint32, 0, count)
+	for i := range count {
+		result, err := h.owner.Do(context.Background(), state.Command{Kind: state.Add, Candidate: notify.Candidate{
+			Summary: "image", Urgency: protocol.UrgencyNormal,
+			Image: &protocol.Image{
+				MediaType: "image/png", Width: protocol.MaxWireImageLongEdge, Height: protocol.MaxWireImageLongEdge,
+				Data: make([]byte, protocol.MaxWireImageBytes-i),
+			},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, result.ID)
+	}
+	client := connectPresenter(t, h.server.SocketPath())
+	defer client.conn.Close()
+	if len(client.snapshot.Active) != count {
+		t.Fatalf("snapshot holds %d active, want %d", len(client.snapshot.Active), count)
+	}
+	for i, notification := range client.snapshot.Active {
+		if notification.ID != ids[i] {
+			t.Fatalf("active[%d] = %d, want %d", i, notification.ID, ids[i])
+		}
+	}
+	if newest := client.snapshot.Active[count-1]; newest.Image == nil {
+		t.Fatal("snapshot dropped the newest image")
+	}
+	if oldest := client.snapshot.Active[0]; oldest.Image != nil {
+		t.Fatal("snapshot kept the oldest image over the frame limit")
+	}
 }
