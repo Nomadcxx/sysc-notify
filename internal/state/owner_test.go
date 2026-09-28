@@ -2,6 +2,8 @@ package state
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"testing"
@@ -416,4 +418,84 @@ func (s *eventSink) Events() []Event {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]Event(nil), s.events...)
+}
+
+func TestOwnerRestartDoesNotReuseHistoryIDs(t *testing.T) {
+	clock := newManualClock()
+	stateHome := t.TempDir()
+	store, err := history.OpenAt(stateHome, clock.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := StartWithHistory(clock, newEventSink(), store)
+	first := do(t, owner, Command{Kind: Add, Candidate: candidate("before restart", time.Minute)}).ID
+	do(t, owner, Command{Kind: Dismiss, ID: first})
+	if err := owner.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := history.OpenAt(stateHome, clock.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := StartWithHistory(clock, newEventSink(), reopened)
+	t.Cleanup(func() { _ = restarted.Close() })
+	second := do(t, restarted, Command{Kind: Add, Candidate: candidate("after restart", time.Minute)}).ID
+	if second <= first {
+		t.Fatalf("restarted owner allocated %d, history holds %d", second, first)
+	}
+	do(t, restarted, Command{Kind: Dismiss, ID: second})
+	got := snapshot(t, restarted)
+	if !historyHasID(got, first) || !historyHasID(got, second) {
+		t.Fatalf("history = %#v, want ids %d and %d", got.History, first, second)
+	}
+}
+
+func TestOwnerCloseCompletesWhenHistoryWriteFails(t *testing.T) {
+	clock := newManualClock()
+	stateHome := t.TempDir()
+	store, err := history.OpenAt(stateHome, clock.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := newEventSink()
+	owner := StartWithHistory(clock, sink, store)
+	t.Cleanup(func() { _ = owner.Close() })
+	id := do(t, owner, Command{Kind: Add, Candidate: candidate("unpersisted", time.Minute)}).ID
+	dir := filepath.Join(stateHome, "sysc-notify")
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	if _, err := owner.Do(context.Background(), Command{Kind: Dismiss, ID: id}); err != nil {
+		t.Fatalf("dismiss with failing history = %v", err)
+	}
+	got := snapshot(t, owner)
+	if hasID(got, id) || historyHasID(got, id) {
+		t.Fatalf("snapshot = %#v", got)
+	}
+	if !hasDelta(sink.Events(), protocol.DeltaClosed) || hasDelta(sink.Events(), protocol.DeltaHistoryAdded) {
+		t.Fatalf("events = %#v", sink.Events())
+	}
+}
+
+func TestOwnerHistoryRetentionCountsFromClose(t *testing.T) {
+	clock := newManualClock()
+	store, err := history.OpenAt(t.TempDir(), clock.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := StartWithHistory(clock, newEventSink(), store)
+	t.Cleanup(func() { _ = owner.Close() })
+	id := do(t, owner, Command{Kind: Add, Candidate: candidate("persistent", 0)}).ID
+	clock.Advance(protocol.HistoryRetention + 24*time.Hour)
+	do(t, owner, Command{Kind: Dismiss, ID: id})
+	got := snapshot(t, owner)
+	if !historyHasID(got, id) {
+		t.Fatalf("history = %#v, want id %d", got.History, id)
+	}
+	if entry := got.History[len(got.History)-1]; !entry.Timestamp.Equal(clock.Now()) {
+		t.Fatalf("history timestamp = %v, want close time %v", entry.Timestamp, clock.Now())
+	}
 }

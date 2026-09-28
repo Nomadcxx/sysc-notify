@@ -97,6 +97,15 @@ func (s *Store) Entries() []protocol.HistoryEntry {
 	return cloneEntries(s.entries)
 }
 
+// IDs returns the ids of the retained entries, oldest first.
+func (s *Store) IDs() []uint32 {
+	ids := make([]uint32, len(s.entries))
+	for i, entry := range s.entries {
+		ids[i] = entry.ID
+	}
+	return ids
+}
+
 func (s *Store) Add(entry protocol.HistoryEntry, now time.Time) (protocol.HistoryEntry, []uint32, error) {
 	entry.Timestamp = entry.Timestamp.UTC()
 	image, err := normalizeHistoryImage(entry.Image)

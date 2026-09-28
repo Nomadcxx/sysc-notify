@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -182,6 +183,10 @@ func (o *Owner) run(clock Clock, sink Sink, store *history.Store) {
 	}
 	if store != nil {
 		state.nextHistorySweep = clock.Now().Add(HistorySweep)
+		// Continue after the ids history kept, so ids stay unique across restarts.
+		for _, id := range store.IDs() {
+			state.nextID = max(state.nextID, id+1)
+		}
 	}
 	state.resetTimer()
 	for {
@@ -288,21 +293,14 @@ func (s *ownerState) addWithProducerKey(candidate notify.Candidate, producerKey 
 	if err := validateCandidate(candidate, now); err != nil {
 		return Result{}, err
 	}
-	live := make(map[uint32]struct{}, len(s.records))
-	for id := range s.records {
-		live[id] = struct{}{}
-	}
-	id, next := notify.ResolveID(candidate.ReplacesID, s.nextID, live)
+	id := candidate.ReplacesID
 	existing, replaced := s.records[id]
-	if !replaced && len(s.records) == protocol.MaxActiveNotifications {
-		s.evictCapacityVictim()
-		live = make(map[uint32]struct{}, len(s.records))
-		for liveID := range s.records {
-			live[liveID] = struct{}{}
+	if !replaced {
+		if len(s.records) == protocol.MaxActiveNotifications {
+			s.evictCapacityVictim()
 		}
-		id, next = notify.ResolveID(candidate.ReplacesID, s.nextID, live)
+		id, s.nextID = notify.ResolveID(0, s.nextID, s.takenIDs())
 	}
-	s.nextID = next
 
 	notification := notificationFromCandidate(id, candidate, now)
 	duration := candidateDuration(candidate)
@@ -397,6 +395,21 @@ func (s *ownerState) closeProducer(request *protocol.ProducerRequest) (Result, e
 	return Result{ID: id}, nil
 }
 
+// takenIDs holds the ids a new notification must not use: the live ones and
+// the ones closed history still names, since a history entry is replaced by id.
+func (s *ownerState) takenIDs() map[uint32]struct{} {
+	taken := make(map[uint32]struct{}, len(s.records))
+	for id := range s.records {
+		taken[id] = struct{}{}
+	}
+	if s.history != nil {
+		for _, id := range s.history.IDs() {
+			taken[id] = struct{}{}
+		}
+	}
+	return taken
+}
+
 func validateCandidate(candidate notify.Candidate, now time.Time) error {
 	if candidate.ExpireTimeout < -1 {
 		return errors.New("state: invalid expiry timeout")
@@ -445,9 +458,13 @@ func (s *ownerState) close(id uint32, reason protocol.CloseReason) error {
 	}
 	s.publishDelta(protocol.Delta{Kind: protocol.DeltaClosed, ID: id, CloseReason: reason})
 	if s.history != nil && !record.candidate.Transient && !record.candidate.Private {
-		entry, removed, err := s.history.Add(historyEntry(record.notification), s.clock.Now())
+		now := s.clock.Now()
+		entry, removed, err := s.history.Add(historyEntry(record.notification, now), now)
 		if err != nil {
-			return err
+			// The close has happened and been announced; history records it
+			// but cannot undo it, so a failed write costs only the entry.
+			log.Printf("sysc-notify: history: drop closed notification %d: %v", id, err)
+			return nil
 		}
 		for _, removedID := range removed {
 			s.publishDelta(protocol.Delta{Kind: protocol.DeltaHistoryRemoved, ID: removedID})
@@ -459,11 +476,13 @@ func (s *ownerState) close(id uint32, reason protocol.CloseReason) error {
 	return nil
 }
 
-func historyEntry(notification protocol.Notification) protocol.HistoryEntry {
+// historyEntry stamps the entry with its close time: retention measures how
+// long ago a notification left, not how long it was shown.
+func historyEntry(notification protocol.Notification, closedAt time.Time) protocol.HistoryEntry {
 	return protocol.HistoryEntry{
 		ID: notification.ID, AppName: notification.AppName, AppIcon: notification.AppIcon,
 		DesktopEntry: notification.DesktopEntry, Summary: notification.Summary, Body: notification.Body,
-		Urgency: notification.Urgency, Category: notification.Category, Timestamp: notification.Timestamp,
+		Urgency: notification.Urgency, Category: notification.Category, Timestamp: closedAt.UTC(),
 		Image: cloneImage(notification.Image),
 	}
 }
