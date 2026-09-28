@@ -25,6 +25,9 @@ const (
 	legacyIconData  = "icon_data"
 )
 
+// convertHints turns D-Bus hint values into the types Normalize reads. Images
+// are optional: a malformed image hint is dropped and the notification is
+// shown without it, rather than refusing the whole Notify call.
 func convertHints(source map[string]dbus.Variant) (map[string]any, error) {
 	if len(source) > protocol.MaxHints {
 		return nil, errors.New("fdo: too many hints")
@@ -48,19 +51,15 @@ func convertHints(source map[string]dbus.Variant) (map[string]any, error) {
 				rawImage, imagePriority = variant.Value(), priority
 			}
 		case notify.HintImagePath:
-			path, ok := variant.Value().(string)
-			if !ok {
-				return nil, errors.New("fdo: malformed image-path hint")
+			if path, ok := variant.Value().(string); ok {
+				result[key] = path
 			}
-			result[key] = path
 		}
 	}
 	if imagePriority < 3 {
-		image, err := convertImageData(rawImage)
-		if err != nil {
-			return nil, err
+		if image, err := convertImageData(rawImage); err == nil {
+			result[notify.HintImageData] = image
 		}
-		result[notify.HintImageData] = image
 	}
 	return result, nil
 }

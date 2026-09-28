@@ -154,6 +154,20 @@ func TestServerConvertsLegacyImageDataAliasesOverDBus(t *testing.T) {
 	}
 }
 
+func TestServerKeepsNotificationWithMalformedImageData(t *testing.T) {
+	h := startHarness(t, nil)
+	id := sendNotify(t, h.object, 0, "text only", map[string]dbus.Variant{
+		"image-data": dbus.MakeVariant([]any{int32(1), int32(1)}),
+	}, 0)
+	snapshot, err := h.owner.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id == 0 || len(snapshot.Active) != 1 || snapshot.Active[0].ID != id || snapshot.Active[0].Image != nil {
+		t.Fatalf("malformed image snapshot = %#v", snapshot.Active)
+	}
+}
+
 func TestServerConvertsImagePathHintOverDBus(t *testing.T) {
 	const path = "/usr/share/icons/hicolor/48x48/apps/example.png"
 	h := startHarness(t, nil)

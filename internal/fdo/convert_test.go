@@ -65,10 +65,27 @@ func TestConvertHintsPrefersCanonicalImageData(t *testing.T) {
 	}
 }
 
-func TestConvertHintsRejectsNonStringImagePath(t *testing.T) {
-	if _, err := convertHints(map[string]dbus.Variant{
-		"image-path": dbus.MakeVariant(int32(1)),
-	}); err == nil {
-		t.Fatal("convertHints() accepted non-string image-path")
+func TestConvertHintsDropsMalformedImageHints(t *testing.T) {
+	for name, hints := range map[string]map[string]dbus.Variant{
+		"image-path":      {notify.HintImagePath: dbus.MakeVariant(int32(1))},
+		"image-data":      {notify.HintImageData: dbus.MakeVariant([]any{int32(1), int32(1)})},
+		"image-data type": {notify.HintImageData: dbus.MakeVariant("not an image")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			hints[notify.HintUrgency] = dbus.MakeVariant(byte(2))
+			got, err := convertHints(hints)
+			if err != nil {
+				t.Fatalf("convertHints() = %v, want the malformed image dropped", err)
+			}
+			if _, ok := got[notify.HintImagePath]; ok {
+				t.Fatalf("hints = %#v, kept malformed image-path", got)
+			}
+			if _, ok := got[notify.HintImageData]; ok {
+				t.Fatalf("hints = %#v, kept malformed image-data", got)
+			}
+			if got[notify.HintUrgency] != byte(2) {
+				t.Fatalf("hints = %#v, lost urgency", got)
+			}
+		})
 	}
 }
