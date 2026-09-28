@@ -92,7 +92,7 @@ go get github.com/Nomadcxx/sysc-notify/protocol
 A presenter connects, sends a hello, and gets a snapshot of every active notification and the
 history, then a stream of changes. It reports what it is showing so expiry pauses while you hover a
 popup. A second presenter that connects replaces the first. The types in `protocol/` are the
-reference, and the [design](docs/plans/2026-08-27-sysc-notify-design.md) explains how the pieces fit.
+reference.
 
 ## Development
 
@@ -101,10 +101,6 @@ go vet ./...
 go test -race -count=1 ./...
 dbus-run-session -- go test -race -count=1 ./tests/integration/
 ```
-
-- [Design](docs/plans/2026-08-27-sysc-notify-design.md)
-- [History persistence](docs/plans/2026-08-30-sysc-notify-persistence-design.md)
-- [Roadmap](docs/roadmap.md)
 
 ## License
 
