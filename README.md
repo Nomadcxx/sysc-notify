@@ -1,4 +1,6 @@
-# sysc-notify
+<p align="center">
+  <img src="assets/header.png" width="920" alt="sysc-notify" />
+</p>
 
 A notification daemon for Linux, written in Go. It owns `org.freedesktop.Notifications` on the
 session bus and hands every notification to [sysc-shell](https://github.com/Nomadcxx/sysc-shell),
@@ -29,7 +31,7 @@ went into history. When the shell restarts, it picks up exactly where it left of
 
 **Requires:** Go 1.26+ and a D-Bus session bus.
 
-### Build from Source
+### From source
 
 ```bash
 git clone https://github.com/Nomadcxx/sysc-notify
