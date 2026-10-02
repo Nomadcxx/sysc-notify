@@ -183,7 +183,7 @@ func nameOwnerMatch() []dbus.MatchOption {
 }
 
 func (e endpoint) GetCapabilities() ([]string, *dbus.Error) {
-	return []string{"actions", "body", "body-markup", "inline-reply", "persistence"}, nil
+	return []string{"actions", "body", "body-markup", "icon-static", "inline-reply", "persistence"}, nil
 }
 
 func (e endpoint) GetServerInformation() (string, string, string, string, *dbus.Error) {
