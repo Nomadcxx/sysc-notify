@@ -3,9 +3,11 @@ package presenter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,6 +49,39 @@ func TestServerCreatesPrivateRuntimeSocketAndRejectsUnsafePaths(t *testing.T) {
 	t.Cleanup(func() { _ = wrongOwnerState.Close() })
 	if err := wrongOwner.Serve(wrongOwnerState); err == nil {
 		t.Fatal("wrong-owner runtime directory succeeded")
+	}
+}
+
+func TestTransientAcceptErrorDoesNotStopTheServer(t *testing.T) {
+	runtimeDir := privateTempDir(t)
+	server := NewAt(runtimeDir)
+	var calls atomic.Int32
+	server.accept = func() (*net.UnixConn, error) {
+		if calls.Add(1) == 1 {
+			return nil, errors.New("temporary emfile")
+		}
+		return server.listener.AcceptUnix()
+	}
+	owner := state.Start(nil, server)
+	if err := server.Serve(owner); err != nil {
+		_ = owner.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = owner.Close()
+	})
+
+	select {
+	case err := <-server.Done():
+		t.Fatalf("transient accept error stopped presenter: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	client := connectPresenter(t, server.SocketPath())
+	defer client.conn.Close()
+	if client.hello.Role != protocol.RolePresenter {
+		t.Fatalf("hello after accept error = %#v", client.hello)
 	}
 }
 

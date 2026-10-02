@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -45,6 +46,9 @@ type Server struct {
 	done      chan error
 	closeOnce sync.Once
 	wg        sync.WaitGroup
+
+	// accept replaces AcceptUnix in tests. Production leaves it nil.
+	accept func() (*net.UnixConn, error)
 }
 
 func NewAt(runtimeDir string) *Server {
@@ -147,23 +151,49 @@ func (s *Server) Publish(event state.Event) bool {
 
 func (s *Server) acceptLoop() {
 	defer s.wg.Done()
+	backoff := time.Millisecond
 	for {
-		conn, err := s.listener.AcceptUnix()
+		conn, err := s.acceptConn()
 		if err != nil {
-			select {
-			case <-s.stop:
-				return
-			default:
-				select {
-				case s.done <- fmt.Errorf("presenter: accept: %w", err):
-				default:
-				}
+			if s.stopping() {
 				return
 			}
+			// ponytail: transient accepts (EMFILE, ECONNABORTED) must not tear
+			// down FDO. Close() always closes stop before the listener, so a
+			// stop-less permanent failure retries at the 1s floor.
+			log.Printf("presenter: accept: %v", err)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-s.stop:
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			if backoff < time.Second {
+				backoff *= 2
+			}
+			continue
 		}
+		backoff = time.Millisecond
 		s.wg.Add(1)
 		go s.handle(conn)
 	}
+}
+
+func (s *Server) stopping() bool {
+	select {
+	case <-s.stop:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) acceptConn() (*net.UnixConn, error) {
+	if s.accept != nil {
+		return s.accept()
+	}
+	return s.listener.AcceptUnix()
 }
 
 func (s *Server) handle(socket *net.UnixConn) {
