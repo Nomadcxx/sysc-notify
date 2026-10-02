@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 
@@ -34,6 +35,16 @@ type Server struct {
 	conn     *dbus.Conn
 	procRoot string
 
+	// Signals leave the owner goroutine through a bounded queue and a dedicated
+	// emitter so a stalled D-Bus write cannot block expiry, Notify, or the
+	// presenter fan-out. Overflow drops the newest signal (ponytail: acceptable
+	// lossy backpressure; a per-client windowed queue if clients ever need
+	// guaranteed delivery). Close does not join emitLoop: a stuck Emit already
+	// holds godbus's send lock, so waiting here would hang teardown before the
+	// connection close can fail the write.
+	emitter   signalEmitter
+	emitQueue chan queuedSignal
+
 	mu        sync.RWMutex
 	owner     *state.Owner
 	attempted bool
@@ -58,7 +69,32 @@ func New(conn *dbus.Conn) *Server {
 func NewAt(conn *dbus.Conn, procRoot string) *Server {
 	return &Server{
 		conn: conn, procRoot: procRoot, signals: make(chan *dbus.Signal, 8), stop: make(chan struct{}),
+		emitter: conn, emitQueue: make(chan queuedSignal, emitQueueSize),
 		done: make(chan error, 1), monitorDone: make(chan struct{}),
+	}
+}
+
+const emitQueueSize = 128
+
+type signalEmitter interface {
+	Emit(path dbus.ObjectPath, name string, body ...any) error
+}
+
+type queuedSignal struct {
+	name string
+	body []any
+}
+
+func (s *Server) emitLoop() {
+	for {
+		select {
+		case <-s.stop:
+			return
+		case signal := <-s.emitQueue:
+			if err := s.emitter.Emit(ObjectPath, Interface+"."+signal.name, signal.body...); err != nil {
+				log.Printf("fdo: emit %s: %v", signal.name, err)
+			}
+		}
 	}
 }
 
@@ -96,6 +132,7 @@ func (s *Server) Serve(owner *state.Owner) error {
 	s.mu.Lock()
 	s.served = true
 	s.mu.Unlock()
+	go s.emitLoop()
 	go s.monitorName(s.conn.Names()[0])
 	return nil
 }
@@ -130,20 +167,28 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) Publish(event state.Event) bool {
-	if s == nil || s.conn == nil {
+	if s == nil || s.emitter == nil {
 		return false
 	}
-	var err error
+	var signals []queuedSignal
 	if event.Delta != nil && event.Delta.Kind == protocol.DeltaClosed {
-		err = errors.Join(err, s.conn.Emit(ObjectPath, Interface+".NotificationClosed", event.Delta.ID, uint32(event.Delta.CloseReason)))
+		signals = append(signals, queuedSignal{"NotificationClosed", []any{event.Delta.ID, uint32(event.Delta.CloseReason)}})
 	}
 	if event.Action != nil {
-		err = errors.Join(err, s.conn.Emit(ObjectPath, Interface+".ActionInvoked", event.Action.ID, event.Action.Key))
+		signals = append(signals, queuedSignal{"ActionInvoked", []any{event.Action.ID, event.Action.Key}})
 	}
 	if event.Reply != nil {
-		err = errors.Join(err, s.conn.Emit(ObjectPath, Interface+".NotificationReplied", event.Reply.ID, event.Reply.Text))
+		signals = append(signals, queuedSignal{"NotificationReplied", []any{event.Reply.ID, event.Reply.Text}})
 	}
-	return err == nil
+	delivered := true
+	for _, signal := range signals {
+		select {
+		case s.emitQueue <- signal:
+		default:
+			delivered = false
+		}
+	}
+	return delivered
 }
 
 func (s *Server) monitorName(uniqueName string) {
