@@ -110,41 +110,50 @@ func Normalize(request Request) (Candidate, error) {
 			}
 			candidate.InlineReply = true
 			candidate.ReplyPlaceholder = placeholder
-		case HintImageData:
-			raw, ok := value.(RawImage)
-			if !ok {
-				candidate.ImageRejected = true
-				continue
-			}
-			image, err := normalizeImage(raw)
-			if err != nil {
-				candidate.ImageRejected = true
-				continue
-			}
-			candidate.Image = image
-		case HintImagePath:
-			path, ok := value.(string)
-			if !ok {
-				candidate.ImageRejected = true
-				continue
-			}
-			if validateString("image path", path, true) != nil {
-				candidate.ImageRejected = true
-				continue
-			}
-			if path == "" || candidate.AppIcon != "" {
-				continue
-			}
-			icon, ok := imagePathIcon(path)
-			if !ok {
-				candidate.ImageRejected = true
-				continue
-			}
-			// ponytail: reuse app_icon's name-or-absolute-path contract; add a distinct wire field only if consumers need source-specific precedence.
-			candidate.AppIcon = icon
 		}
 	}
+	applyImageHints(&candidate, request.Hints)
 	return candidate, nil
+}
+
+// applyImageHints follows the Freedesktop image precedence: a present
+// image-data hint hides image-path, and either hint replaces app_icon when
+// it decodes. A malformed image is dropped and Notify still succeeds.
+func applyImageHints(candidate *Candidate, hints map[string]any) {
+	if raw, ok := hints[HintImageData]; ok {
+		image, isImage := raw.(RawImage)
+		if !isImage {
+			candidate.ImageRejected = true
+			return
+		}
+		decoded, err := normalizeImage(image)
+		if err != nil {
+			candidate.ImageRejected = true
+			return
+		}
+		candidate.Image = decoded
+		candidate.AppIcon = ""
+		return
+	}
+	raw, ok := hints[HintImagePath]
+	if !ok {
+		return
+	}
+	path, isString := raw.(string)
+	if !isString || validateString("image path", path, true) != nil {
+		candidate.ImageRejected = true
+		return
+	}
+	if path == "" {
+		return
+	}
+	icon, ok := imagePathIcon(path)
+	if !ok {
+		candidate.ImageRejected = true
+		return
+	}
+	// ponytail: reuse app_icon's name-or-absolute-path contract; add a distinct wire field only if consumers need source-specific precedence.
+	candidate.AppIcon = icon
 }
 
 // imagePathIcon reads an image-path hint the way the spec defines it: a
