@@ -75,8 +75,8 @@ func TestServerMetadataAndNotifyReplacement(t *testing.T) {
 	if err := h.object.Call(Interface+".GetCapabilities", 0).Store(&capabilities); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(capabilities, []string{"actions", "body", "body-markup", "inline-reply", "persistence"}) {
-		t.Fatalf("capabilities = %v, want [actions body body-markup inline-reply persistence]", capabilities)
+	if !reflect.DeepEqual(capabilities, []string{"actions", "body", "body-markup", "icon-static", "inline-reply", "persistence"}) {
+		t.Fatalf("capabilities = %v, want [actions body body-markup icon-static inline-reply persistence]", capabilities)
 	}
 
 	first := sendNotify(t, h.object, 0, "first", nil, -1)
