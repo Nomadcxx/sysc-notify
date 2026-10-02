@@ -247,6 +247,55 @@ func TestPresentationRenewReturnsAuthoritativeLifetimes(t *testing.T) {
 	}
 }
 
+func TestReplacedPresenterCannotRenewOrDismiss(t *testing.T) {
+	clock := newPresenterClock()
+	h := startServerHarness(t, clock)
+	id := addCandidate(t, h.owner, "live", 10*time.Second)
+	first := connectPresenter(t, h.server.SocketPath())
+	renew := protocol.Command{
+		Kind:          protocol.CommandPresentationRenew,
+		Presentations: []protocol.Presentation{{ID: id, State: protocol.PresentationQueued}},
+	}
+	if err := writeEnvelope(first.conn, protocol.KindCommand, 1, 0, renew); err != nil {
+		t.Fatal(err)
+	}
+	if reply := readReply(t, first.conn, 1); !reply.OK {
+		t.Fatalf("first renew = %#v", reply)
+	}
+
+	second := connectPresenter(t, h.server.SocketPath())
+	defer second.conn.Close()
+	assertSocketClosed(t, first.conn)
+	if err := writeEnvelope(second.conn, protocol.KindCommand, 1, 0, renew); err != nil {
+		t.Fatal(err)
+	}
+	if reply := readReply(t, second.conn, 1); !reply.OK {
+		t.Fatalf("replacement renew = %#v", reply)
+	}
+
+	staleDismiss := executeCommand(h.owner, 1, protocol.Command{Kind: protocol.CommandDismiss, ID: id})
+	if staleDismiss.OK || staleDismiss.Error == nil || staleDismiss.Error.Code != protocol.ErrorStale {
+		t.Fatalf("stale dismiss = %#v", staleDismiss)
+	}
+	staleRenew := executeCommand(h.owner, 1, protocol.Command{
+		Kind:          protocol.CommandPresentationRenew,
+		Presentations: []protocol.Presentation{{ID: id, State: protocol.PresentationVisible}},
+	})
+	if staleRenew.OK || staleRenew.Error == nil || staleRenew.Error.Code != protocol.ErrorStale {
+		t.Fatalf("stale renew = %#v", staleRenew)
+	}
+	clock.Advance(10 * time.Second)
+	if !activeIDs(snapshotOwner(t, h.owner), id) {
+		t.Fatal("replaced presenter changed the live lease")
+	}
+	if err := writeEnvelope(second.conn, protocol.KindCommand, 2, 0, protocol.Command{Kind: protocol.CommandDismiss, ID: id}); err != nil {
+		t.Fatal(err)
+	}
+	if reply := readReply(t, second.conn, 2); !reply.OK {
+		t.Fatalf("live dismiss = %#v", reply)
+	}
+}
+
 func TestSecondPresenterReplacesGeneration(t *testing.T) {
 	h := startServerHarness(t, nil)
 	addCandidate(t, h.owner, "record", 0)

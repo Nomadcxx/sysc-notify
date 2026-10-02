@@ -15,9 +15,20 @@ func (s *ownerState) renew(generation uint64, presentations []protocol.Presentat
 	if err := command.Validate(); err != nil {
 		return err
 	}
+	// Generations move forward with the connection that owns the socket.
+	// An older renew, or a renew from a generation PresenterLost already
+	// retired, must not clear the live lease and install itself.
+	if s.acceptedGeneration != 0 && generation < s.acceptedGeneration {
+		return ErrStale
+	}
+	if s.presenterRetired && generation == s.acceptedGeneration {
+		return ErrStale
+	}
 	if s.presenterGeneration != 0 && generation != s.presenterGeneration {
 		s.clearPresentation(now)
 	}
+	s.acceptedGeneration = generation
+	s.presenterRetired = false
 	s.presenterGeneration = generation
 	s.leaseDeadline = now.Add(PresentationLease)
 

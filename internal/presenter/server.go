@@ -279,10 +279,17 @@ func (s *Server) handle(socket *net.UnixConn) {
 	s.current = c
 	s.preparing = nil
 	s.mu.Unlock()
+	var previous uint64
 	if old != nil {
 		old.fail()
-		_, _ = owner.Do(context.Background(), state.Command{Kind: state.PresenterLost, Generation: old.generation})
+		previous = old.generation
 	}
+	// Bind this generation before readLoop. PresenterLost retires the replaced
+	// generation in the same owner turn, so a command still blocked in Do
+	// cannot renew the old lease or dismiss a live notification afterwards.
+	_, _ = owner.Do(context.Background(), state.Command{
+		Kind: state.PresenterLost, Generation: previous, NextGeneration: c.generation,
+	})
 
 	writerStarted = true
 	go c.writeLoop()
