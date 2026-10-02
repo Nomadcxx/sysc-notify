@@ -3,6 +3,7 @@ package history
 import (
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/Nomadcxx/sysc-notify/protocol"
@@ -60,7 +61,11 @@ func decodeDocument(doc document, imageDir string) ([]protocol.HistoryEntry, err
 	for i, entry := range doc.Entries {
 		image, err := loadImage(imageDir, entry.Image)
 		if err != nil {
-			return nil, fmt.Errorf("history: entry %d image: %w", i, err)
+			// ponytail: a broken sidecar costs only that entry's image;
+			// quarantine is reserved for structural damage to history.json.
+			// cleanupImages then removes the unreferenced sidecar.
+			log.Printf("history: drop image for entry %d: %v", entry.ID, err)
+			image = nil
 		}
 		entries[i] = protocol.HistoryEntry{
 			ID: entry.ID, Seen: entry.Seen, AppName: entry.AppName, AppIcon: entry.AppIcon,

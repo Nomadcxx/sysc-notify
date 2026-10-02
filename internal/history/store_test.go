@@ -218,6 +218,78 @@ func TestStoreDownscalesAndReusesContentAddressedImage(t *testing.T) {
 	}
 }
 
+func TestCorruptImageSidecarDoesNotQuarantineHistory(t *testing.T) {
+	stateHome := t.TempDir()
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	store, err := OpenAt(stateHome, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := testEntry(1, now)
+	damaged := testEntry(2, now)
+	damaged.Summary = "with image"
+	damaged.Image = testPNG(t, 8, 8)
+	kept := testEntry(3, now)
+	kept.Summary = "other image"
+	kept.Image = testPNG(t, 4, 4)
+	if _, _, err := store.Add(plain, now); err != nil {
+		t.Fatal(err)
+	}
+	addedDamaged, _, err := store.Add(damaged, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addedKept, _, err := store.Add(kept, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference := imageReference(addedDamaged.Image)
+	sidecar := filepath.Join(stateHome, "sysc-notify", "images", reference.SHA256+".png")
+	if err := os.Truncate(sidecar, 4); err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(stateHome, "sysc-notify", "images", "orphan.png")
+	if err := os.WriteFile(orphan, []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenAt(stateHome, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(stateHome, "sysc-notify")
+	matches, err := filepath.Glob(filepath.Join(dir, "history.quarantine-*.json"))
+	if err != nil || len(matches) != 0 {
+		t.Fatalf("quarantine matches = %v, %v", matches, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, historyFilename)); err != nil {
+		t.Fatalf("history.json: %v", err)
+	}
+	got := reopened.Entries()
+	if len(got) != 3 {
+		t.Fatalf("entries = %d, want 3", len(got))
+	}
+	byID := make(map[uint32]protocol.HistoryEntry, len(got))
+	for _, entry := range got {
+		byID[entry.ID] = entry
+	}
+	if byID[1].Summary != "record" || byID[1].Image != nil {
+		t.Fatalf("plain entry = %#v", byID[1])
+	}
+	if byID[2].Summary != "with image" || byID[2].Image != nil {
+		t.Fatalf("damaged entry = %#v", byID[2])
+	}
+	if byID[3].Summary != "other image" || byID[3].Image == nil || !bytes.Equal(byID[3].Image.Data, addedKept.Image.Data) {
+		t.Fatalf("kept image entry = %#v", byID[3])
+	}
+	if _, err := os.Stat(sidecar); !os.IsNotExist(err) {
+		t.Fatalf("damaged sidecar retained: %v", err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("orphan sidecar retained: %v", err)
+	}
+}
+
 func TestStoreRejectsSymlinkPath(t *testing.T) {
 	root := t.TempDir()
 	realState := filepath.Join(root, "real")
