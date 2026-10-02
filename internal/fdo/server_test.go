@@ -9,13 +9,14 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/godbus/dbus/v5"
 
 	"github.com/Nomadcxx/sysc-notify/internal/dbustest"
-
+	"github.com/Nomadcxx/sysc-notify/internal/notify"
 	"github.com/Nomadcxx/sysc-notify/internal/state"
 	"github.com/Nomadcxx/sysc-notify/protocol"
 )
@@ -227,6 +228,75 @@ func TestServerEmitsCloseReasons(t *testing.T) {
 	assertSignal(t, signals, "NotificationClosed", oldest, uint32(protocol.CloseUndefined))
 }
 
+func TestBlockingEmitDoesNotStallExpiryOrNotify(t *testing.T) {
+	requireSessionBus(t)
+	serverConn, err := dbus.Connect(dbustest.Session(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := New(serverConn)
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	var once sync.Once
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	server.emitter = emitFunc(func(path dbus.ObjectPath, name string, values ...any) error {
+		once.Do(func() { close(entered) })
+		<-release
+		return serverConn.Emit(path, name, values...)
+	})
+	owner := state.Start(nil, server)
+	if err := server.Serve(owner); err != nil {
+		_ = owner.Close()
+		_ = serverConn.Close()
+		t.Fatal(err)
+	}
+	client, err := dbus.Connect(dbustest.Session(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		unblock()
+		_ = client.Close()
+		_ = server.Close()
+		_ = owner.Close()
+		_ = serverConn.Close()
+	})
+	object := client.Object(BusName, ObjectPath)
+	signals := watchSignals(t, client)
+
+	expired := sendNotify(t, object, 0, "expired", nil, 80)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expiry did not reach D-Bus emit")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	result, err := owner.Do(ctx, state.Command{Kind: state.Add, Candidate: notify.Candidate{
+		Summary: "while emit is blocked", ExpireTimeout: 0,
+	}})
+	if err != nil {
+		t.Fatalf("owner stalled while D-Bus emit was blocked: %v", err)
+	}
+	snapshot, err := owner.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("snapshot stalled while D-Bus emit was blocked: %v", err)
+	}
+	if len(snapshot.Active) != 1 || snapshot.Active[0].ID != result.ID || snapshot.Active[0].Summary != "while emit is blocked" {
+		t.Fatalf("active after blocked emit = %#v, want only the notification added during the stall", snapshot.Active)
+	}
+	for _, active := range snapshot.Active {
+		if active.ID == expired {
+			t.Fatal("expired notification still active while emit was blocked")
+		}
+	}
+
+	unblock()
+	assertSignal(t, signals, "NotificationClosed", expired, uint32(protocol.CloseExpired))
+}
+
 func TestServerEmitsActionAndReplyBeforeClose(t *testing.T) {
 	h := startHarness(t, nil)
 	signals := watchSignals(t, h.client)
@@ -370,4 +440,10 @@ func assertSignal(t *testing.T, signals <-chan *dbus.Signal, member string, body
 func requireSessionBus(t *testing.T) {
 	t.Helper()
 	dbustest.Session(t)
+}
+
+type emitFunc func(path dbus.ObjectPath, name string, values ...any) error
+
+func (f emitFunc) Emit(path dbus.ObjectPath, name string, values ...any) error {
+	return f(path, name, values...)
 }
