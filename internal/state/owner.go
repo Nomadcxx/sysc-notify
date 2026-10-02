@@ -433,6 +433,11 @@ func notificationFromCandidate(id uint32, candidate notify.Candidate, now time.T
 func candidateDuration(candidate notify.Candidate) time.Duration {
 	switch candidate.ExpireTimeout {
 	case -1:
+		// The spec lets the server default vary by type. Critical alerts stay
+		// until dismissed; every other urgency keeps the short default.
+		if candidate.Urgency == protocol.UrgencyCritical {
+			return 0
+		}
 		return DefaultTimeout
 	case 0:
 		return 0

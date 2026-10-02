@@ -139,6 +139,70 @@ func TestReplacementTimeoutUsesCurrentPresentationState(t *testing.T) {
 	waitForMissing(t, owner, id)
 }
 
+func TestCriticalDefaultTimeoutStaysUntilDismissed(t *testing.T) {
+	clock, owner := startClockOwner(t)
+	critical := candidate("disk", -time.Millisecond)
+	critical.Urgency = protocol.UrgencyCritical
+	id := do(t, owner, Command{Kind: Add, Candidate: critical}).ID
+
+	clock.Advance(DefaultTimeout)
+	if !hasID(snapshot(t, owner), id) {
+		t.Fatal("critical notification with the server default timeout expired at 5s")
+	}
+	clock.Advance(24 * time.Hour)
+	if !hasID(snapshot(t, owner), id) {
+		t.Fatal("critical notification with the server default timeout expired")
+	}
+
+	normal := candidate("note", -time.Millisecond)
+	normalID := do(t, owner, Command{Kind: Add, Candidate: normal}).ID
+	clock.Advance(DefaultTimeout - time.Millisecond)
+	if !hasID(snapshot(t, owner), normalID) {
+		t.Fatal("non-critical default timeout expired early")
+	}
+	clock.Advance(time.Millisecond)
+	waitForMissing(t, owner, normalID)
+	if !hasID(snapshot(t, owner), id) {
+		t.Fatal("critical notification expired alongside the normal one")
+	}
+}
+
+func TestCriticalExplicitTimeoutStillExpires(t *testing.T) {
+	clock, owner := startClockOwner(t)
+	critical := candidate("disk", 2*time.Second)
+	critical.Urgency = protocol.UrgencyCritical
+	id := do(t, owner, Command{Kind: Add, Candidate: critical}).ID
+	clock.Advance(2*time.Second - time.Millisecond)
+	if !hasID(snapshot(t, owner), id) {
+		t.Fatal("explicit critical timeout expired early")
+	}
+	clock.Advance(time.Millisecond)
+	waitForMissing(t, owner, id)
+}
+
+func TestDefaultTimeoutReplacementFollowsNewUrgency(t *testing.T) {
+	clock, owner := startClockOwner(t)
+	critical := candidate("disk", -time.Millisecond)
+	critical.Urgency = protocol.UrgencyCritical
+	id := do(t, owner, Command{Kind: Add, Candidate: critical}).ID
+
+	normal := candidate("note", -time.Millisecond)
+	normal.ReplacesID = id
+	do(t, owner, Command{Kind: Add, Candidate: normal})
+	clock.Advance(DefaultTimeout)
+	waitForMissing(t, owner, id)
+
+	id = do(t, owner, Command{Kind: Add, Candidate: candidate("note", -time.Millisecond)}).ID
+	critical = candidate("disk", -time.Millisecond)
+	critical.Urgency = protocol.UrgencyCritical
+	critical.ReplacesID = id
+	do(t, owner, Command{Kind: Add, Candidate: critical})
+	clock.Advance(DefaultTimeout * 2)
+	if !hasID(snapshot(t, owner), id) {
+		t.Fatal("critical replacement of a default-timeout notification expired")
+	}
+}
+
 func TestExpiryEmitsExpiredCloseReason(t *testing.T) {
 	clock := newManualClock()
 	sink := newEventSink()
