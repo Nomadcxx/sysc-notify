@@ -126,14 +126,77 @@ func TestNormalizeImagePathRejectsWhatIsNeitherNameNorPath(t *testing.T) {
 	}
 }
 
-func TestNormalizeImagePathDoesNotReplaceAppIcon(t *testing.T) {
+func TestNormalizeImagePathOverridesAppIcon(t *testing.T) {
 	const path = "/usr/share/icons/hicolor/48x48/apps/example.png"
-	got, err := Normalize(Request{AppIcon: "preferred", Hints: map[string]any{"image-path": path}})
+	got, err := Normalize(Request{AppIcon: "preferred", Hints: map[string]any{HintImagePath: path}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.AppIcon != "preferred" {
-		t.Fatalf("AppIcon = %q, want preferred", got.AppIcon)
+	if got.AppIcon != path || got.Image != nil || got.ImageRejected {
+		t.Fatalf("image-path = %#v, want AppIcon %q", got, path)
+	}
+}
+
+func TestNormalizeImageDataClearsAppIcon(t *testing.T) {
+	got, err := Normalize(Request{
+		AppIcon: "firefox",
+		Hints:   map[string]any{HintImageData: onePixel()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AppIcon != "" || got.Image == nil || got.ImageRejected {
+		t.Fatalf("image-data = %#v, want pixmap and empty AppIcon", got)
+	}
+}
+
+func TestNormalizeImageDataHidesImagePath(t *testing.T) {
+	const path = "/usr/share/icons/hicolor/48x48/apps/example.png"
+	got, err := Normalize(Request{
+		AppIcon: "firefox",
+		Hints: map[string]any{
+			HintImageData: onePixel(),
+			HintImagePath: path,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AppIcon != "" || got.Image == nil || got.ImageRejected {
+		t.Fatalf("both image hints = %#v, want pixmap only", got)
+	}
+}
+
+func TestMalformedImageDataKeepsAppIconAndIgnoresPath(t *testing.T) {
+	got, err := Normalize(Request{
+		AppIcon: "firefox",
+		Hints: map[string]any{
+			HintImageData: RawImage{Width: 1, Height: 1, RowStride: 3, BitsPerSample: 16, Channels: 3, Data: []byte{0, 0, 0}},
+			HintImagePath: "/usr/share/icons/hicolor/48x48/apps/example.png",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AppIcon != "firefox" || got.Image != nil || !got.ImageRejected {
+		t.Fatalf("malformed image-data = %#v", got)
+	}
+}
+
+func TestNormalizeEmptyImagePathKeepsAppIcon(t *testing.T) {
+	got, err := Normalize(Request{AppIcon: "preferred", Hints: map[string]any{HintImagePath: ""}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AppIcon != "preferred" || got.Image != nil || got.ImageRejected {
+		t.Fatalf("empty image-path = %#v, want AppIcon preferred", got)
+	}
+}
+
+func onePixel() RawImage {
+	return RawImage{
+		Width: 1, Height: 1, RowStride: 4, HasAlpha: true, BitsPerSample: 8, Channels: 4,
+		Data: []byte{9, 8, 7, 255},
 	}
 }
 
