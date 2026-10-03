@@ -40,10 +40,12 @@ type Store struct {
 	workerGen int // generation durably committed (or attempted)
 	closed    bool
 	lastErr   error
+	closeOnce sync.Once
 
 	wake       chan struct{}
 	closing    chan struct{}
 	workerDone chan struct{}
+	closeDone  chan struct{}
 }
 
 func Open(now time.Time) (*Store, error) {
@@ -82,7 +84,7 @@ func OpenAt(stateHome string, now time.Time) (*Store, error) {
 	}
 	store := &Store{
 		dir: dir, imageDir: imageDir,
-		wake: make(chan struct{}, 1), closing: make(chan struct{}), workerDone: make(chan struct{}),
+		wake: make(chan struct{}, 1), closing: make(chan struct{}), workerDone: make(chan struct{}), closeDone: make(chan struct{}),
 	}
 	store.cond = sync.NewCond(&store.mu)
 	contents, err := readPrivateRegularFile(filepath.Join(dir, historyFilename), maxHistoryJSONBytes)
@@ -196,38 +198,46 @@ func (s *Store) schedule() {
 // committed (or has failed). It reports the first persistence error.
 func (s *Store) Flush() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for s.workerGen < s.writeGen && !s.closed {
 		s.cond.Wait()
 	}
-	return s.lastErr
+	if s.closed {
+		s.mu.Unlock()
+		<-s.closeDone
+		s.mu.Lock()
+	}
+	err := s.lastErr
+	s.mu.Unlock()
+	return err
 }
 
 // Close stops the persistence goroutine and commits any state left pending,
 // then reports the first persistence error. The store must not be used after
 // Close.
 func (s *Store) Close() error {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return s.lastErr
-	}
-	s.closed = true
-	dirty := s.dirty
-	var target []protocol.HistoryEntry
-	if dirty {
-		target = cloneEntries(s.entries)
-	}
-	s.mu.Unlock()
-	close(s.closing)
-	<-s.workerDone
-	if dirty {
-		if err := s.commit(target); err != nil {
-			s.recordErr(err)
-		} else {
-			s.clearErr()
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		dirty := s.dirty
+		var target []protocol.HistoryEntry
+		if dirty {
+			target = cloneEntries(s.entries)
 		}
-	}
+		s.mu.Unlock()
+		close(s.closing)
+		<-s.workerDone
+		if dirty {
+			if err := s.commit(target); err != nil {
+				s.recordErr(err)
+			} else {
+				s.clearErr()
+			}
+		}
+		s.mu.Lock()
+		s.cond.Broadcast()
+		s.mu.Unlock()
+		close(s.closeDone)
+	})
 	s.mu.Lock()
 	err := s.lastErr
 	s.mu.Unlock()
