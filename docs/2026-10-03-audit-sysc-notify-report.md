@@ -12,8 +12,8 @@
 |---|---|---|
 | `internal/presenter/connection.go:88` — `enqueueDelta` calls `c.fail()` when `reserve` or the `select` default fails | **F1** A bounded presenter queue that fills under a burst tears the whole connection down, forcing the shell to reconnect | `internal/presenter/connection.go:127` `reserve`; `protocol/types.go:25` `MaxPresenterQueueMessages=256` |
 | `internal/state/owner.go:510,542,556,570`; `internal/state/expiry.go:98`; `internal/state/owner.go:664` | **F2** History disk I/O (`Write`+`Sync`+`Rename`, ~21 ms per image entry) runs on the owner goroutine, stalling every command behind it | `internal/history/store.go` `commit` |
-| `internal/presenter/server.go:127` (`main`) | **F3** Deltas published while a presenter is in the `preparing` handshake state are dropped for that connection; the window is bounded but real | `internal/presenter/connection.go:39` `prepare` |
-| `cmd/sysc-notify/main.go:18` — only `os.Exit(1)` in the process | **F4** No reachable panic in production code. The daemon is not the source of a Go-level crash | — |
+| `internal/presenter/server.go:127` (`main`) | **F3** Handshake deltas are sequence-filtered: the snapshot covers earlier events, and later deltas are queued | `internal/presenter/connection.go:39` `prepare` |
+| Captured error: shell-side Wayland `create_region` protocol failure | **F4** The observed crash is a shell protocol failure, not a `sysc-notify` panic | `cmd/sysc-notify/main.go:18` |
 | `internal/fdo/server.go` `Publish` `default:` on `emitQueue` | **F5** FDO signal emission drops on overflow by design; informational, not a fault | `internal/fdo/server.go` |
 
 ## 1. Method
@@ -64,9 +64,9 @@ Every mutator and the periodic sweep run `history.Store.commit` — a JSON marsh
 
 While a connection is in `s.preparing`, `Publish` calls `prepare` (`internal/presenter/connection.go:39`), which buffers deltas for that connection. Deltas published before the handshake snapshot are handled by `activate` (dropped if `sequence <= snapshot.Sequence`, otherwise queued). The window is bounded by the handshake timeout, and the fresh snapshot supersedes it. Informational.
 
-### F4 — no reachable panic (Informational)
+### F4 - captured crash originates in the shell (Informational)
 
-The only `os.Exit` is `cmd/sysc-notify/main.go:18`. There is no reachable panic path in production code. The daemon cannot be the source of a Go-level crash — the shell's crash is a Wayland protocol error (companion report).
+The captured error is a Wayland `create_region` protocol failure in the shell. `main` calls `os.Exit(1)` when `app.Run` returns an error. The audit found no explicit `panic` call in production code.
 
 ### F5 — FDO emit queue drops on overflow (Informational)
 
