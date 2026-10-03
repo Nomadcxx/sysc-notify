@@ -43,6 +43,7 @@ func TestInvalidHistoryIsQuarantinedAndNeverOverwritten(t *testing.T) {
 			if _, _, err := store.Add(testEntry(1, time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)), time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)); err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(func() { _ = store.Close() })
 			after, err := os.ReadFile(matches[0])
 			if err != nil || string(after) != contents {
 				t.Fatalf("quarantine was overwritten = %q, %v", after, err)
@@ -74,6 +75,9 @@ func TestOrphansWaitForValidCommitAndInterruptedTempIsIgnored(t *testing.T) {
 		t.Fatalf("orphan removed without a valid committed reference set: %v", err)
 	}
 	if _, _, err := store.Add(testEntry(7, now), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Flush(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(orphan); !os.IsNotExist(err) {

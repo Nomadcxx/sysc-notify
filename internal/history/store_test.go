@@ -28,6 +28,9 @@ func TestStorePersistsVersionedHistory(t *testing.T) {
 	if _, _, err := store.Add(entry, now); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
 
 	contents, err := os.ReadFile(filepath.Join(stateHome, "sysc-notify", "history.json"))
 	if err != nil {
@@ -76,6 +79,9 @@ func TestOpenPersistsRetentionSweep(t *testing.T) {
 	if _, _, err := store.Add(testEntry(1, now), now); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	later := now.Add(protocol.HistoryRetention + time.Nanosecond)
 	reopened, err := OpenAt(stateHome, later)
 	if err != nil {
@@ -121,6 +127,9 @@ func TestStoreBoundsAndSweepsHistory(t *testing.T) {
 	if len(removed) != protocol.MaxHistoryEntries || len(store.Entries()) != 0 {
 		t.Fatalf("sweep removed=%d remaining=%d", len(removed), len(store.Entries()))
 	}
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	reopened, err := OpenAt(stateHome, now.Add(protocol.HistoryRetention+2*time.Minute))
 	if err != nil {
 		t.Fatal(err)
@@ -153,10 +162,14 @@ func TestSeenAndClearAreIdempotent(t *testing.T) {
 	if err != nil || len(changed) != 0 {
 		t.Fatalf("idempotent mark seen = %v, %v", changed, err)
 	}
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	reopened, err := OpenAt(stateHome, now)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = reopened.Close() })
 	if got := reopened.Entries(); len(got) != 2 || !got[0].Seen || !got[1].Seen {
 		t.Fatalf("seen state after restart = %#v", got)
 	}
@@ -186,6 +199,9 @@ func TestStoreDownscalesAndReusesContentAddressedImage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	if added.Image == nil || added.Image.Width != 96 || added.Image.Height != 48 {
 		t.Fatalf("stored image = %#v", added.Image)
 	}
@@ -199,6 +215,9 @@ func TestStoreDownscalesAndReusesContentAddressedImage(t *testing.T) {
 	}
 	entry.ID = 2
 	if _, _, err := store.Add(entry, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Flush(); err != nil {
 		t.Fatal(err)
 	}
 	after, err := os.Stat(images[0])
@@ -241,6 +260,9 @@ func TestCorruptImageSidecarDoesNotQuarantineHistory(t *testing.T) {
 	}
 	addedKept, _, err := store.Add(kept, now)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Flush(); err != nil {
 		t.Fatal(err)
 	}
 	reference := imageReference(addedDamaged.Image)
@@ -334,6 +356,7 @@ func TestStoreRemoveDropsKnownIDsOnly(t *testing.T) {
 	if len(s.Entries()) != 2 {
 		t.Fatalf("entries = %d, want 2", len(s.Entries()))
 	}
+	t.Cleanup(func() { _ = s.Close() })
 }
 
 func testEntry(id uint32, timestamp time.Time) protocol.HistoryEntry {
