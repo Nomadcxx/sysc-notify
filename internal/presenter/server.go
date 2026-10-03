@@ -125,6 +125,9 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) Publish(event state.Event) bool {
+	if event.Snapshot != nil {
+		return s.publishSnapshot(event)
+	}
 	if event.Delta == nil {
 		return true
 	}
@@ -139,14 +142,66 @@ func (s *Server) Publish(event state.Event) bool {
 	s.mu.Lock()
 	preparing, current := s.preparing, s.current
 	var prepared, published = true, true
+	var resync bool
+	var resyncGeneration uint64
 	if preparing != nil {
 		prepared = preparing.prepare(message)
 	}
 	if current != nil {
-		published = current.enqueueDelta(message)
+		published, resync = current.enqueueDelta(message)
+		if resync {
+			resyncGeneration = current.generation
+		}
 	}
 	s.mu.Unlock()
+	if resync {
+		// Ask the owner off the Publish path: Publish is called by the owner
+		// goroutine, and requestResync calls Owner.Do, which would deadlock.
+		go s.requestResync(resyncGeneration)
+	}
 	return prepared && published
+}
+
+// publishSnapshot delivers a resync snapshot built by the owner. It is scoped
+// to the connection whose generation requested it, and only while that
+// connection still needs a rebase.
+func (s *Server) publishSnapshot(event state.Event) bool {
+	frame, err := marshalSnapshot(*event.Snapshot)
+	if err != nil {
+		return false
+	}
+	s.mu.Lock()
+	current := s.current
+	s.mu.Unlock()
+	if current == nil {
+		return true
+	}
+	if event.Generation != 0 && current.generation != event.Generation {
+		return true
+	}
+	return current.enqueueSnapshot(frame, event.Snapshot.Sequence)
+}
+
+// requestResync asks the owner for a fresh snapshot for one presenter
+// generation. It runs outside the Publish path so the owner goroutine cannot
+// block waiting on itself.
+func (s *Server) requestResync(generation uint64) {
+	s.mu.Lock()
+	owner := s.owner
+	s.mu.Unlock()
+	if owner == nil {
+		return
+	}
+	if _, err := owner.Do(context.Background(), state.Command{Kind: state.PresenterResync, Generation: generation}); err != nil {
+		// Without the snapshot the connection would silently drop every delta.
+		// Fail it instead so the shell reconnects and rebuilds from a snapshot.
+		s.mu.Lock()
+		current := s.current
+		s.mu.Unlock()
+		if current != nil && current.generation == generation {
+			current.fail()
+		}
+	}
 }
 
 func (s *Server) acceptLoop() {

@@ -40,6 +40,12 @@ type Event struct {
 	Delta    *protocol.Delta
 	Action   *ActionEvent
 	Reply    *ReplyEvent
+	// Snapshot carries a full projection in response to PresenterResync. It is
+	// published on the same channel as deltas and serialized with them by the
+	// owner goroutine, so its Sequence is a valid baseline that no later delta
+	// predates. Generation scopes it to the connection that asked for it.
+	Snapshot   *protocol.Snapshot
+	Generation uint64
 }
 
 type ActionEvent struct {
@@ -68,6 +74,10 @@ const (
 	HistoryMarkSeen
 	ProducerPublish
 	ProducerClose
+	// PresenterResync asks for a fresh snapshot on the owner goroutine so a
+	// presenter that overflowed its bounded queue can be rebased without a
+	// reconnect. It never mutates state and never advances the sequence.
+	PresenterResync
 )
 
 type Command struct {
@@ -93,6 +103,7 @@ type Owner struct {
 	stop     chan struct{}
 	done     chan struct{}
 	once     sync.Once
+	store    *history.Store
 }
 
 type request struct {
@@ -119,6 +130,7 @@ func StartWithHistory(clock Clock, sink Sink, store *history.Store) *Owner {
 		requests: make(chan request),
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
+		store:    store,
 	}
 	go o.run(clock, sink, store)
 	return o
@@ -172,6 +184,9 @@ func (o *Owner) Snapshot(ctx context.Context) (protocol.Snapshot, error) {
 func (o *Owner) Close() error {
 	o.once.Do(func() { close(o.stop) })
 	<-o.done
+	if o.store != nil {
+		return o.store.Flush()
+	}
 	return nil
 }
 
@@ -280,6 +295,10 @@ func (s *ownerState) do(command Command) (Result, error) {
 		return Result{}, s.removeHistory(command.IDs)
 	case HistoryMarkSeen:
 		return Result{}, s.markHistorySeen(command.IDs)
+	case PresenterResync:
+		snapshot := s.snapshot()
+		s.publish(Event{Generation: command.Generation, Sequence: snapshot.Sequence, Snapshot: &snapshot})
+		return Result{}, nil
 	default:
 		return Result{}, errors.New("state: unknown command")
 	}

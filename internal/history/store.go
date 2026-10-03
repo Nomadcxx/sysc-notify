@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/Nomadcxx/sysc-notify/protocol"
@@ -20,10 +22,29 @@ const (
 	maxHistoryJSONBytes = 8 << 20
 )
 
+// Store keeps the retained history in memory as the authoritative state and
+// persists it on a background goroutine. Mutations (Add, Sweep, Remove,
+// MarkSeen, Clear) update the in-memory entries synchronously so snapshots
+// and deltas never wait on disk, and schedule a single coalesced commit.
+// Durability is therefore eventual: call Flush to block until the scheduled
+// state is on disk, and Close before exiting the process.
 type Store struct {
 	dir      string
 	imageDir string
-	entries  []protocol.HistoryEntry
+
+	mu        sync.Mutex
+	cond      *sync.Cond
+	entries   []protocol.HistoryEntry // authoritative in-memory state
+	pending   []protocol.HistoryEntry // durable target for the next commit
+	dirty     bool
+	writeGen  int // incremented by every mutation
+	workerGen int // generation durably committed (or attempted)
+	closed    bool
+	lastErr   error
+
+	wake       chan struct{}
+	closing    chan struct{}
+	workerDone chan struct{}
 }
 
 func Open(now time.Time) (*Store, error) {
@@ -60,9 +81,14 @@ func OpenAt(stateHome string, now time.Time) (*Store, error) {
 	if err := os.Chmod(imageDir, 0o700); err != nil {
 		return nil, fmt.Errorf("history: secure image directory: %w", err)
 	}
-	store := &Store{dir: dir, imageDir: imageDir}
+	store := &Store{
+		dir: dir, imageDir: imageDir,
+		wake: make(chan struct{}, 1), closing: make(chan struct{}), workerDone: make(chan struct{}),
+	}
+	store.cond = sync.NewCond(&store.mu)
 	contents, err := readPrivateRegularFile(filepath.Join(dir, historyFilename), maxHistoryJSONBytes)
 	if errors.Is(err, os.ErrNotExist) {
+		go store.persistLoop()
 		return store, nil
 	}
 	if err != nil {
@@ -80,25 +106,125 @@ func OpenAt(stateHome string, now time.Time) (*Store, error) {
 		if quarantineErr := quarantine(dir, now); quarantineErr != nil {
 			return nil, errors.Join(fmt.Errorf("history: invalid committed file: %w", err), quarantineErr)
 		}
+		go store.persistLoop()
 		return store, nil
 	}
 	retained := retain(store.entries, now)
 	if len(retained) != len(store.entries) {
+		store.entries = cloneEntries(retained)
 		if err := store.commit(retained); err != nil {
 			return nil, err
 		}
 	} else if err := cleanupImages(imageDir, store.entries); err != nil {
 		return nil, err
 	}
+	go store.persistLoop()
 	return store, nil
 }
 
+// persistLoop owns all disk commits, coalescing concurrent mutations into one
+// commit of the latest state. wake carries a stale token (dirty is the
+// authoritative flag); closing asks the loop to stop without touching disk.
+func (s *Store) persistLoop() {
+	defer close(s.workerDone)
+	for {
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return
+		}
+		if s.dirty {
+			target := s.pending
+			gen := s.writeGen
+			s.dirty = false
+			s.mu.Unlock()
+			if err := s.commit(target); err != nil {
+				s.recordErr(err)
+			}
+			s.mu.Lock()
+			if gen > s.workerGen {
+				s.workerGen = gen
+			}
+			s.cond.Broadcast()
+			s.mu.Unlock()
+			continue
+		}
+		s.mu.Unlock()
+		select {
+		case <-s.wake:
+		case <-s.closing:
+		}
+	}
+}
+
+func (s *Store) recordErr(err error) {
+	log.Printf("sysc-notify: history: persist: %v", err)
+	s.mu.Lock()
+	if s.lastErr == nil {
+		s.lastErr = err
+	}
+	s.mu.Unlock()
+}
+
+// schedule marks the current in-memory entries as the next durable target.
+// Callers hold s.mu.
+func (s *Store) schedule() {
+	s.writeGen++
+	s.pending = cloneEntries(s.entries)
+	s.dirty = true
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// Flush blocks until every mutation scheduled before the call is durably
+// committed (or has failed). It reports the first persistence error.
+func (s *Store) Flush() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for s.workerGen < s.writeGen && !s.closed {
+		s.cond.Wait()
+	}
+	return s.lastErr
+}
+
+// Close stops the persistence goroutine and commits any state left pending,
+// then reports the first persistence error. The store must not be used after
+// Close.
+func (s *Store) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return s.lastErr
+	}
+	s.closed = true
+	dirty := s.dirty
+	target := s.pending
+	s.mu.Unlock()
+	close(s.closing)
+	<-s.workerDone
+	if dirty {
+		if err := s.commit(target); err != nil {
+			s.recordErr(err)
+		}
+	}
+	s.mu.Lock()
+	err := s.lastErr
+	s.mu.Unlock()
+	return err
+}
+
 func (s *Store) Entries() []protocol.HistoryEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return cloneEntries(s.entries)
 }
 
 // IDs returns the ids of the retained entries, oldest first.
 func (s *Store) IDs() []uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	ids := make([]uint32, len(s.entries))
 	for i, entry := range s.entries {
 		ids[i] = entry.ID
@@ -119,6 +245,7 @@ func (s *Store) Add(entry protocol.HistoryEntry, now time.Time) (protocol.Histor
 	if entry.Timestamp.Before(now.Add(-protocol.HistoryRetention)) {
 		return protocol.HistoryEntry{}, nil, nil
 	}
+	s.mu.Lock()
 	next := cloneEntries(s.entries)
 	removed := make([]uint32, 0, 2)
 	for i := 0; i < len(next); {
@@ -134,17 +261,15 @@ func (s *Store) Add(entry protocol.HistoryEntry, now time.Time) (protocol.Histor
 		removed = append(removed, next[0].ID)
 		next = next[1:]
 	}
-	if err := writeImage(s.imageDir, entry.Image); err != nil {
-		return protocol.HistoryEntry{}, nil, err
-	}
-	if err := s.commit(next); err != nil {
-		return protocol.HistoryEntry{}, nil, err
-	}
+	s.entries = next
+	s.schedule()
+	s.mu.Unlock()
 	return cloneEntry(entry), removed, nil
 }
 
 func (s *Store) Sweep(now time.Time) ([]uint32, error) {
 	cutoff := now.Add(-protocol.HistoryRetention)
+	s.mu.Lock()
 	next := make([]protocol.HistoryEntry, 0, len(s.entries))
 	removed := make([]uint32, 0)
 	for _, entry := range s.entries {
@@ -155,11 +280,12 @@ func (s *Store) Sweep(now time.Time) ([]uint32, error) {
 		next = append(next, cloneEntry(entry))
 	}
 	if len(removed) == 0 {
+		s.mu.Unlock()
 		return nil, nil
 	}
-	if err := s.commit(next); err != nil {
-		return nil, err
-	}
+	s.entries = next
+	s.schedule()
+	s.mu.Unlock()
 	return removed, nil
 }
 
@@ -174,6 +300,7 @@ func (s *Store) Remove(ids []uint32) ([]uint32, error) {
 	for _, id := range ids {
 		drop[id] = struct{}{}
 	}
+	s.mu.Lock()
 	next := make([]protocol.HistoryEntry, 0, len(s.entries))
 	removed := make([]uint32, 0, len(ids))
 	for _, e := range s.entries {
@@ -184,11 +311,12 @@ func (s *Store) Remove(ids []uint32) ([]uint32, error) {
 		next = append(next, cloneEntry(e))
 	}
 	if len(removed) == 0 {
+		s.mu.Unlock()
 		return nil, nil
 	}
-	if err := s.commit(next); err != nil {
-		return nil, err
-	}
+	s.entries = next
+	s.schedule()
+	s.mu.Unlock()
 	return removed, nil
 }
 
@@ -197,6 +325,7 @@ func (s *Store) MarkSeen(ids []uint32) ([]uint32, error) {
 	for _, id := range ids {
 		wanted[id] = struct{}{}
 	}
+	s.mu.Lock()
 	next := cloneEntries(s.entries)
 	changed := make([]uint32, 0, len(ids))
 	for i := range next {
@@ -206,29 +335,43 @@ func (s *Store) MarkSeen(ids []uint32) ([]uint32, error) {
 		}
 	}
 	if len(changed) == 0 {
+		s.mu.Unlock()
 		return nil, nil
 	}
-	if err := s.commit(next); err != nil {
-		return nil, err
-	}
+	s.entries = next
+	s.schedule()
+	s.mu.Unlock()
 	return changed, nil
 }
 
 func (s *Store) Clear() ([]uint32, error) {
+	s.mu.Lock()
 	if len(s.entries) == 0 {
+		s.mu.Unlock()
 		return nil, nil
 	}
 	removed := make([]uint32, len(s.entries))
 	for i, entry := range s.entries {
 		removed[i] = entry.ID
 	}
-	if err := s.commit(nil); err != nil {
-		return nil, err
-	}
+	s.entries = nil
+	s.schedule()
+	s.mu.Unlock()
 	return removed, nil
 }
 
+// commit writes the given entries atomically (temporary file, fsync, rename,
+// directory sync) and cleans up orphaned image sidecars. It is called only by
+// the persistence loop or during OpenAt; it never touches s.entries.
 func (s *Store) commit(entries []protocol.HistoryEntry) error {
+	for i := range entries {
+		if entries[i].Image == nil {
+			continue
+		}
+		if err := writeImage(s.imageDir, entries[i].Image); err != nil {
+			return fmt.Errorf("history: write image: %w", err)
+		}
+	}
 	contents, err := json.Marshal(encodeDocument(entries))
 	if err != nil {
 		return fmt.Errorf("history: encode: %w", err)
@@ -262,11 +405,10 @@ func (s *Store) commit(entries []protocol.HistoryEntry) error {
 		return fmt.Errorf("history: commit: %w", err)
 	}
 	keep = true
-	s.entries = cloneEntries(entries)
 	if err := syncDirectory(s.dir); err != nil {
 		return err
 	}
-	if err := cleanupImages(s.imageDir, s.entries); err != nil {
+	if err := cleanupImages(s.imageDir, entries); err != nil {
 		return err
 	}
 	return nil

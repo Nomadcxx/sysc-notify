@@ -85,7 +85,10 @@ func TestPresenterReconnectAndServiceRestartRestoreOnlyPublicHistory(t *testing.
 	}
 }
 
-func TestSlowPresenterIsDroppedWithoutBlockingDBus(t *testing.T) {
+// A presenter that does not read fast enough overflows its bounded queue. It
+// must be rebased with a fresh snapshot—not dropped—and D-Bus must stay
+// responsive throughout, so a burst harness cannot tear the connection down.
+func TestSlowPresenterIsResyncedWithoutBlockingDBus(t *testing.T) {
 	requireSessionBus(t)
 	d := startDaemon(t, "", "")
 	client := connectBus(t)
@@ -109,15 +112,36 @@ func TestSlowPresenterIsDroppedWithoutBlockingDBus(t *testing.T) {
 		t.Fatal("D-Bus stopped responding after slow presenter")
 	}
 
-	if err := slow.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+	if err := slow.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	for range 500 {
-		if _, err := protocol.ReadFrame(slow); err != nil {
-			return
+	// The reader is intentionally stalled during the burst, so the handshake
+	// hello and baseline snapshot are still queued. Consume them first; only a
+	// snapshot after the baseline proves the resync fired.
+	for {
+		envelope := readEnvelope(t, slow)
+		if envelope.Kind == protocol.KindSnapshot {
+			break
 		}
 	}
-	t.Fatal("slow presenter remained connected")
+	sawResync := false
+	for range 4000 {
+		frame, err := protocol.ReadFrame(slow)
+		if err != nil {
+			t.Fatalf("slow presenter was dropped instead of resynced: %v", err)
+		}
+		var envelope protocol.Envelope
+		if err := protocol.DecodeStrict(frame, &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if envelope.Kind == protocol.KindSnapshot {
+			sawResync = true
+			break
+		}
+	}
+	if !sawResync {
+		t.Fatal("slow presenter never received a resync snapshot")
+	}
 }
 
 func connectPresenter(t *testing.T, runtimeDir string) *net.UnixConn {

@@ -51,17 +51,17 @@ func Run(ctx context.Context, config Config) error {
 	sink := &eventSink{sinks: []state.Sink{presentation}}
 	owner := state.StartWithHistory(nil, sink, store)
 	if err := presentation.Serve(owner); err != nil {
-		return errors.Join(err, shutdown(owner, presentation, nil, nil))
+		return errors.Join(err, shutdown(owner, presentation, nil, nil, store))
 	}
 
 	conn, err := dbus.ConnectSessionBus()
 	if err != nil {
-		return errors.Join(err, shutdown(owner, presentation, nil, nil))
+		return errors.Join(err, shutdown(owner, presentation, nil, nil, store))
 	}
 	service := fdo.NewAt(conn, config.ProcRoot)
 	sink.add(service)
 	if err := service.Serve(owner); err != nil {
-		return errors.Join(err, shutdown(owner, presentation, service, conn))
+		return errors.Join(err, shutdown(owner, presentation, service, conn, store))
 	}
 	if config.Ready != nil {
 		close(config.Ready)
@@ -83,10 +83,10 @@ func Run(ctx context.Context, config Config) error {
 			runErr = errors.New("app: D-Bus service stopped")
 		}
 	}
-	return errors.Join(runErr, shutdown(owner, presentation, service, conn))
+	return errors.Join(runErr, shutdown(owner, presentation, service, conn, store))
 }
 
-func shutdown(owner *state.Owner, presentation *presenter.Server, service *fdo.Server, conn *dbus.Conn) error {
+func shutdown(owner *state.Owner, presentation *presenter.Server, service *fdo.Server, conn *dbus.Conn, store *history.Store) error {
 	var err error
 	if presentation != nil {
 		err = errors.Join(err, presentation.Close())
@@ -96,6 +96,9 @@ func shutdown(owner *state.Owner, presentation *presenter.Server, service *fdo.S
 	}
 	if owner != nil {
 		err = errors.Join(err, owner.Close())
+	}
+	if store != nil {
+		err = errors.Join(err, store.Close())
 	}
 	if conn != nil {
 		err = errors.Join(err, conn.Close())

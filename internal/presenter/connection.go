@@ -30,16 +30,28 @@ type connection struct {
 	lastRequestID  uint64
 	active         bool
 	failed         bool
+	// resyncNeeded is set when the bounded queue overflowed. While set, the
+	// writer swaps in a fresh snapshot once the queue has drained, rebasing the
+	// projection instead of tearing the connection down. Deltas published after
+	// that snapshot arrive before it is written and are held in resyncTail so
+	// they stay contiguous with the new baseline.
+	resyncNeeded    bool
+	resyncScheduled bool
+	resyncFrame     []byte
+	resyncSeq       uint64
+	resyncTail      []outbound
+	resyncTailBytes int
 
 	closed     chan struct{}
 	writerDone chan struct{}
+	wake       chan struct{}
 	failOnce   sync.Once
 }
 
 func newConnection(socket *net.UnixConn, generation uint64) *connection {
 	return &connection{
 		socket: socket, generation: generation, queue: make(chan outbound, protocol.MaxPresenterQueueMessages),
-		closed: make(chan struct{}), writerDone: make(chan struct{}),
+		closed: make(chan struct{}), writerDone: make(chan struct{}), wake: make(chan struct{}, 1),
 	}
 }
 
@@ -81,24 +93,87 @@ func (c *connection) activate(sequence uint64) bool {
 	return true
 }
 
-func (c *connection) enqueueDelta(message outbound) bool {
+// enqueueDelta queues one delta. It reports whether the connection is still
+// usable and, when it is, whether the caller must arrange a resync because the
+// bounded queue overflowed. A resync is requested instead of failing so a slow
+// reader loses intermediate frames but keeps its generation.
+func (c *connection) enqueueDelta(message outbound) (published bool, resync bool) {
 	c.mu.Lock()
-	if c.failed || !c.active || protocol.ValidateNextSequence(c.lastSequence, message.sequence) != nil || !c.reserve(message) {
+	if c.failed || !c.active {
+		c.mu.Unlock()
+		return false, false
+	}
+	if c.resyncNeeded {
+		// Before the snapshot lands, deltas are superseded by it and dropped:
+		// the owner builds the snapshot only after every one of them, so the
+		// snapshot's sequence covers them all.
+		if c.resyncFrame == nil {
+			c.mu.Unlock()
+			return true, false
+		}
+		// After it lands, later deltas extend the new baseline and must be kept
+		// so the projection stays contiguous from the snapshot. The queue is
+		// still full of pre-snapshot frames, so the tail is bounded separately.
+		expected := c.resyncSeq + uint64(len(c.resyncTail)) + 1
+		if message.sequence != expected || !c.reserveTail(message) {
+			c.mu.Unlock()
+			c.fail()
+			return false, false
+		}
+		c.resyncTail = append(c.resyncTail, message)
+		c.mu.Unlock()
+		return true, false
+	}
+	if protocol.ValidateNextSequence(c.lastSequence, message.sequence) != nil {
 		c.mu.Unlock()
 		c.fail()
-		return false
+		return false, false
+	}
+	if !c.reserve(message) {
+		resync = c.beginResyncLocked()
+		c.mu.Unlock()
+		return true, resync
 	}
 	c.lastSequence = message.sequence
 	select {
 	case c.queue <- message:
 		c.mu.Unlock()
-		return true
+		return true, false
 	default:
 		c.release(message)
+		resync = c.beginResyncLocked()
 		c.mu.Unlock()
-		c.fail()
+		return true, resync
+	}
+}
+
+// beginResyncLocked arms a snapshot swap and reports whether this call is the
+// one that must ask the owner for it. Callers hold c.mu.
+func (c *connection) beginResyncLocked() bool {
+	c.resyncNeeded = true
+	if c.resyncScheduled {
 		return false
 	}
+	c.resyncScheduled = true
+	return true
+}
+
+// enqueueSnapshot stores a freshly built snapshot and wakes the writer. The
+// writer drains any queued deltas first, so the snapshot's sequence is a clean
+// baseline for the frames that follow it.
+func (c *connection) enqueueSnapshot(frame []byte, sequence uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.failed || !c.active || !c.resyncNeeded || c.resyncFrame != nil {
+		return false
+	}
+	c.resyncFrame = frame
+	c.resyncSeq = sequence
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+	return true
 }
 
 func (c *connection) enqueue(message outbound) bool {
@@ -130,6 +205,17 @@ func (c *connection) reserve(message outbound) bool {
 	return true
 }
 
+// reserveTail bounds the post-snapshot buffer independently of the main queue,
+// which is still draining its pre-snapshot frames when the tail fills.
+func (c *connection) reserveTail(message outbound) bool {
+	if len(c.resyncTail) >= protocol.MaxPresenterQueueMessages ||
+		c.resyncTailBytes > protocol.MaxPresenterDecodedBytes-len(message.data) {
+		return false
+	}
+	c.resyncTailBytes += len(message.data)
+	return true
+}
+
 func (c *connection) release(message outbound) {
 	c.queuedMessages--
 	c.queuedBytes -= len(message.data)
@@ -150,9 +236,20 @@ func (c *connection) fail() {
 func (c *connection) writeLoop() {
 	defer close(c.writerDone)
 	for {
+		// A scheduled snapshot is written only after every queued delta has
+		// drained, so the baseline never trails a frame already on the wire.
+		if frame, ok := c.takeResync(); ok {
+			if err := protocol.WriteFrame(c.socket, frame); err != nil {
+				c.fail()
+				return
+			}
+			continue
+		}
 		select {
 		case <-c.closed:
 			return
+		case <-c.wake:
+			continue
 		case message := <-c.queue:
 			if err := protocol.WriteFrame(c.socket, message.data); err != nil {
 				c.fail()
@@ -163,6 +260,33 @@ func (c *connection) writeLoop() {
 			c.mu.Unlock()
 		}
 	}
+}
+
+// takeResync consumes a pending snapshot once the queue is empty. It writes the
+// snapshot ahead of the buffered post-snapshot deltas and rebases lastSequence
+// so those deltas continue contiguously from the new baseline.
+func (c *connection) takeResync() ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.resyncFrame == nil || len(c.queue) != 0 {
+		return nil, false
+	}
+	frame := c.resyncFrame
+	c.resyncFrame = nil
+	// The tail was reserved against the same bound as the queue, and the queue
+	// is empty, so moving it over cannot block.
+	for _, message := range c.resyncTail {
+		c.queue <- message
+		c.queuedMessages++
+		c.queuedBytes += len(message.data)
+	}
+	c.lastSequence = c.resyncSeq + uint64(len(c.resyncTail))
+	c.resyncTail = nil
+	c.resyncTailBytes = 0
+	c.resyncSeq = 0
+	c.resyncNeeded = false
+	c.resyncScheduled = false
+	return frame, true
 }
 
 func (c *connection) readLoop(owner *state.Owner) {

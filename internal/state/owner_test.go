@@ -471,12 +471,19 @@ func TestOwnerCloseCompletesWhenHistoryWriteFails(t *testing.T) {
 	if _, err := owner.Do(context.Background(), Command{Kind: Dismiss, ID: id}); err != nil {
 		t.Fatalf("dismiss with failing history = %v", err)
 	}
+	// Persistence is async: the failed write is recorded in memory and
+	// reported (and logged) by the background commit, so snapshots and
+	// deltas still reflect the entry; restarting without a working disk
+	// loses it. Close must not hang on the failure.
 	got := snapshot(t, owner)
-	if hasID(got, id) || historyHasID(got, id) {
-		t.Fatalf("snapshot = %#v", got)
+	if !historyHasID(got, id) {
+		t.Fatalf("snapshot history = %#v, want id %d retained in memory", got.History, id)
 	}
-	if !hasDelta(sink.Events(), protocol.DeltaClosed) || hasDelta(sink.Events(), protocol.DeltaHistoryAdded) {
+	if !hasDelta(sink.Events(), protocol.DeltaClosed) || !hasDelta(sink.Events(), protocol.DeltaHistoryAdded) {
 		t.Fatalf("events = %#v", sink.Events())
+	}
+	if err := owner.Close(); err == nil {
+		t.Fatalf("close with failing history persistence = %v, want error", err)
 	}
 }
 
