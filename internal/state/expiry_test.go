@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -111,6 +112,65 @@ func TestPresentationLeaseExpiryAndDisconnectClearHolds(t *testing.T) {
 			clock.Advance(10 * time.Second)
 			waitForMissing(t, owner, id)
 		})
+	}
+}
+
+func TestStaleRenewDoesNotStealLiveLease(t *testing.T) {
+	clock, owner := startClockOwner(t)
+	id := do(t, owner, Command{Kind: Add, Candidate: candidate("live", 10*time.Second)}).ID
+	present(t, owner, 2, id, protocol.PresentationQueued)
+
+	_, err := owner.Do(context.Background(), Command{
+		Kind: PresentationRenew, Generation: 1,
+		Presentations: []protocol.Presentation{{ID: id, State: protocol.PresentationVisible}},
+	})
+	if !errors.Is(err, ErrStale) {
+		t.Fatalf("older renew error = %v, want ErrStale", err)
+	}
+	clock.Advance(10 * time.Second)
+	if !hasID(snapshot(t, owner), id) {
+		t.Fatal("stale renew replaced the live presenter lease")
+	}
+}
+
+func TestRetiredGenerationCannotReinstallLease(t *testing.T) {
+	clock, owner := startClockOwner(t)
+	id := do(t, owner, Command{Kind: Add, Candidate: candidate("retired", 10*time.Second)}).ID
+	present(t, owner, 1, id, protocol.PresentationQueued)
+	do(t, owner, Command{Kind: PresenterLost, Generation: 1})
+
+	_, err := owner.Do(context.Background(), Command{
+		Kind: PresentationRenew, Generation: 1,
+		Presentations: []protocol.Presentation{{ID: id, State: protocol.PresentationQueued}},
+	})
+	if !errors.Is(err, ErrStale) {
+		t.Fatalf("renew after disconnect error = %v, want ErrStale", err)
+	}
+	clock.Advance(10 * time.Second)
+	waitForMissing(t, owner, id)
+}
+
+func TestSameGenerationRenewsAfterLeaseExpiry(t *testing.T) {
+	clock, owner := startClockOwner(t)
+	id := do(t, owner, Command{Kind: Add, Candidate: candidate("held", 10*time.Second)}).ID
+	present(t, owner, 1, id, protocol.PresentationQueued)
+	clock.Advance(PresentationLease)
+	present(t, owner, 1, id, protocol.PresentationQueued)
+	clock.Advance(10 * time.Second)
+	if !hasID(snapshot(t, owner), id) {
+		t.Fatal("lease expiry retired the connected presenter")
+	}
+}
+
+func TestOlderPresenterLostDoesNotDropNewerLease(t *testing.T) {
+	clock, owner := startClockOwner(t)
+	id := do(t, owner, Command{Kind: Add, Candidate: candidate("newer", 10*time.Second)}).ID
+	present(t, owner, 1, id, protocol.PresentationQueued)
+	present(t, owner, 2, id, protocol.PresentationQueued)
+	do(t, owner, Command{Kind: PresenterLost, Generation: 1})
+	clock.Advance(10 * time.Second)
+	if !hasID(snapshot(t, owner), id) {
+		t.Fatal("presenter lost for an older generation cleared the live lease")
 	}
 }
 

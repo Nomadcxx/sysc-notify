@@ -48,6 +48,9 @@ func Normalize(request Request) (Candidate, error) {
 		}
 		actionKeys[action.Key] = struct{}{}
 		candidate.Actions = append(candidate.Actions, action)
+		if action.Key == ActionInlineReply {
+			candidate.InlineReply = true
+		}
 	}
 
 	for key, value := range request.Hints {

@@ -20,6 +20,8 @@ type connection struct {
 	socket     *net.UnixConn
 	generation uint64
 	producer   bool
+	ctx        context.Context
+	cancel     context.CancelFunc
 
 	mu             sync.Mutex
 	queue          chan outbound
@@ -49,8 +51,10 @@ type connection struct {
 }
 
 func newConnection(socket *net.UnixConn, generation uint64) *connection {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &connection{
-		socket: socket, generation: generation, queue: make(chan outbound, protocol.MaxPresenterQueueMessages),
+		socket: socket, generation: generation, ctx: ctx, cancel: cancel,
+		queue:  make(chan outbound, protocol.MaxPresenterQueueMessages),
 		closed: make(chan struct{}), writerDone: make(chan struct{}), wake: make(chan struct{}, 1),
 	}
 }
@@ -230,6 +234,9 @@ func (c *connection) fail() {
 		if c.socket != nil {
 			_ = c.socket.Close()
 		}
+		// Unblock owner.Do calls not yet received by the owner; commands
+		// arriving after PresenterLost are rejected by the generation gate.
+		c.cancel()
 	})
 }
 
@@ -307,7 +314,7 @@ func (c *connection) readLoop(owner *state.Owner) {
 			return
 		}
 		c.lastRequestID = envelope.RequestID
-		reply := executeCommandForConnection(owner, c.generation, c.producer, command)
+		reply := executeCommandForConnection(c.ctx, owner, c.generation, c.producer, command)
 		payload, err := marshalEnvelope(protocol.KindReply, envelope.RequestID, 0, reply)
 		if err != nil || !c.enqueue(outbound{data: payload}) {
 			return
@@ -316,18 +323,20 @@ func (c *connection) readLoop(owner *state.Owner) {
 }
 
 func executeCommand(owner *state.Owner, generation uint64, command protocol.Command) protocol.Reply {
-	return executeCommandForConnection(owner, generation, false, command)
+	return executeCommandForConnection(context.Background(), owner, generation, false, command)
 }
 
-func executeCommandForConnection(owner *state.Owner, generation uint64, producer bool, command protocol.Command) protocol.Reply {
+func executeCommandForConnection(ctx context.Context, owner *state.Owner, generation uint64, producer bool, command protocol.Command) protocol.Reply {
 	if (command.Kind == protocol.CommandProducerPublish || command.Kind == protocol.CommandProducerClose) && !producer {
 		return protocol.Reply{Error: &protocol.ProtocolError{Code: protocol.ErrorUnavailable, Message: "producer capability was not negotiated"}}
 	}
-	stateCommand := state.Command{ID: command.ID, ActionKey: command.ActionKey, ReplyText: command.Text, IDs: append([]uint32(nil), command.IDs...)}
+	stateCommand := state.Command{
+		ID: command.ID, ActionKey: command.ActionKey, ReplyText: command.Text,
+		IDs: append([]uint32(nil), command.IDs...), Generation: generation,
+	}
 	switch command.Kind {
 	case protocol.CommandPresentationRenew:
 		stateCommand.Kind = state.PresentationRenew
-		stateCommand.Generation = generation
 		stateCommand.Presentations = append([]protocol.Presentation(nil), command.Presentations...)
 	case protocol.CommandAction:
 		stateCommand.Kind = state.InvokeAction
@@ -350,13 +359,15 @@ func executeCommandForConnection(owner *state.Owner, generation uint64, producer
 		stateCommand.Kind = state.ProducerClose
 		stateCommand.Producer = command.Producer
 	}
-	result, err := owner.Do(context.Background(), stateCommand)
+	result, err := owner.Do(ctx, stateCommand)
 	if err == nil {
 		return protocol.Reply{OK: true, ID: result.ID, Replaced: result.Replaced, Lifetimes: result.Lifetimes}
 	}
 	code := protocol.ErrorInvalid
 	if errors.Is(err, state.ErrNotFound) {
 		code = protocol.ErrorNotFound
+	} else if errors.Is(err, state.ErrStale) {
+		code = protocol.ErrorStale
 	} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		code = protocol.ErrorUnavailable
 	}

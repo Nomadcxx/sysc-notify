@@ -19,7 +19,10 @@ const (
 	HistorySweep      = time.Minute
 )
 
-var ErrNotFound = errors.New("state: notification not found")
+var (
+	ErrNotFound = errors.New("state: notification not found")
+	ErrStale    = errors.New("state: stale presenter generation")
+)
 
 type Timer interface {
 	C() <-chan time.Time
@@ -81,15 +84,16 @@ const (
 )
 
 type Command struct {
-	Kind          CommandKind
-	Candidate     notify.Candidate
-	Producer      *protocol.ProducerRequest
-	ID            uint32
-	ActionKey     string
-	ReplyText     string
-	Generation    uint64
-	IDs           []uint32
-	Presentations []protocol.Presentation
+	Kind           CommandKind
+	Candidate      notify.Candidate
+	Producer       *protocol.ProducerRequest
+	ID             uint32
+	ActionKey      string
+	ReplyText      string
+	Generation     uint64
+	NextGeneration uint64
+	IDs            []uint32
+	Presentations  []protocol.Presentation
 }
 
 type Result struct {
@@ -250,6 +254,8 @@ type ownerState struct {
 	sequence    uint64
 
 	presenterGeneration uint64
+	acceptedGeneration  uint64
+	presenterRetired    bool
 	leaseDeadline       time.Time
 	timer               Timer
 	timerC              <-chan time.Time
@@ -257,6 +263,9 @@ type ownerState struct {
 }
 
 func (s *ownerState) do(command Command) (Result, error) {
+	if err := s.gatePresenter(command); err != nil {
+		return Result{}, err
+	}
 	now := s.clock.Now()
 	switch command.Kind {
 	case Add:
@@ -282,6 +291,15 @@ func (s *ownerState) do(command Command) (Result, error) {
 		if command.Generation != 0 && command.Generation == s.presenterGeneration {
 			s.clearPresentation(now)
 		}
+		// NextGeneration is the connection that just became current. Binding it
+		// here, before that connection can submit commands, is what makes a
+		// late command from the replaced socket stale.
+		if command.NextGeneration > s.acceptedGeneration {
+			s.acceptedGeneration = command.NextGeneration
+			s.presenterRetired = false
+		} else if command.Generation != 0 && command.Generation == s.acceptedGeneration && command.NextGeneration == 0 {
+			s.presenterRetired = true
+		}
 		return Result{}, nil
 	case DismissAll:
 		var result error
@@ -302,6 +320,30 @@ func (s *ownerState) do(command Command) (Result, error) {
 	default:
 		return Result{}, errors.New("state: unknown command")
 	}
+}
+
+// gatePresenter rejects presenter commands whose generation is not the one
+// bound to the live connection. Generation 0 is a service-originated command
+// (FDO close, history maintenance) and is not a presenter generation.
+func (s *ownerState) gatePresenter(command Command) error {
+	switch command.Kind {
+	case Dismiss, InvokeAction, SubmitReply, DismissAll,
+		HistoryClear, HistoryRemove, HistoryMarkSeen,
+		ProducerPublish, ProducerClose:
+		return s.requirePresenter(command.Generation)
+	default:
+		return nil
+	}
+}
+
+func (s *ownerState) requirePresenter(generation uint64) error {
+	if generation == 0 {
+		return nil
+	}
+	if s.presenterRetired || generation != s.acceptedGeneration {
+		return ErrStale
+	}
+	return nil
 }
 
 func (s *ownerState) add(candidate notify.Candidate, now time.Time) (Result, error) {
@@ -445,7 +487,8 @@ func notificationFromCandidate(id uint32, candidate notify.Candidate, now time.T
 		Actions: append([]protocol.Action(nil), candidate.Actions...), Urgency: candidate.Urgency,
 		Category: candidate.Category, Timestamp: now.UTC(), ExpireTimeoutMS: candidate.ExpireTimeout,
 		Image: cloneImage(candidate.Image), Value: value, InlineReply: candidate.InlineReply,
-		SenderLineage: append([]protocol.Process(nil), candidate.Sender.Lineage...),
+		ReplyPlaceholder: candidate.ReplyPlaceholder,
+		SenderLineage:    append([]protocol.Process(nil), candidate.Sender.Lineage...),
 	}
 }
 

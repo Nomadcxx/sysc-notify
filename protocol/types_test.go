@@ -14,21 +14,22 @@ func TestSnapshotRoundTripAndValidate(t *testing.T) {
 	want := Snapshot{
 		Sequence: 4,
 		Active: []Notification{{
-			ID:              7,
-			AppName:         "Browser",
-			AppIcon:         "browser",
-			DesktopEntry:    "browser.desktop",
-			Summary:         "Download complete",
-			Body:            "report.pdf",
-			Actions:         []Action{{Key: "default", Label: "Open"}},
-			Urgency:         UrgencyNormal,
-			Category:        "transfer.complete",
-			Timestamp:       now,
-			ExpireTimeoutMS: 5000,
-			Image:           &Image{MediaType: "image/png", Width: 32, Height: 16, Data: []byte("png")},
-			Value:           &value,
-			InlineReply:     true,
-			SenderLineage:   []Process{{PID: 42, StartTime: 1234}},
+			ID:               7,
+			AppName:          "Browser",
+			AppIcon:          "browser",
+			DesktopEntry:     "browser.desktop",
+			Summary:          "Download complete",
+			Body:             "report.pdf",
+			Actions:          []Action{{Key: "default", Label: "Open"}},
+			Urgency:          UrgencyNormal,
+			Category:         "transfer.complete",
+			Timestamp:        now,
+			ExpireTimeoutMS:  5000,
+			Image:            &Image{MediaType: "image/png", Width: 32, Height: 16, Data: []byte("png")},
+			Value:            &value,
+			InlineReply:      true,
+			ReplyPlaceholder: "Reply to Alice",
+			SenderLineage:    []Process{{PID: 42, StartTime: 1234}},
 		}},
 		Lifetimes: []Lifetime{{ID: 7, DurationMS: 5000, RemainingMS: 5000, Running: true}},
 		History: []HistoryEntry{{
@@ -52,6 +53,9 @@ func TestSnapshotRoundTripAndValidate(t *testing.T) {
 	}
 	if got.Active[0].Value == nil || *got.Active[0].Value != value {
 		t.Fatalf("round-trip value = %v, want %d", got.Active[0].Value, value)
+	}
+	if got.Active[0].ReplyPlaceholder != "Reply to Alice" || !strings.Contains(string(data), `"reply_placeholder":"Reply to Alice"`) {
+		t.Fatalf("reply placeholder = %q in %s", got.Active[0].ReplyPlaceholder, data)
 	}
 }
 

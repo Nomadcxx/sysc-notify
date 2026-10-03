@@ -74,21 +74,22 @@ const (
 )
 
 type Notification struct {
-	ID              uint32    `json:"id"`
-	AppName         string    `json:"app_name,omitempty"`
-	AppIcon         string    `json:"app_icon,omitempty"`
-	DesktopEntry    string    `json:"desktop_entry,omitempty"`
-	Summary         string    `json:"summary"`
-	Body            string    `json:"body,omitempty"`
-	Actions         []Action  `json:"actions,omitempty"`
-	Urgency         Urgency   `json:"urgency"`
-	Category        string    `json:"category,omitempty"`
-	Timestamp       time.Time `json:"timestamp"`
-	ExpireTimeoutMS int32     `json:"expire_timeout_ms"`
-	Image           *Image    `json:"image,omitempty"`
-	Value           *int32    `json:"value,omitempty"`
-	InlineReply     bool      `json:"inline_reply,omitempty"`
-	SenderLineage   []Process `json:"sender_lineage,omitempty"`
+	ID               uint32    `json:"id"`
+	AppName          string    `json:"app_name,omitempty"`
+	AppIcon          string    `json:"app_icon,omitempty"`
+	DesktopEntry     string    `json:"desktop_entry,omitempty"`
+	Summary          string    `json:"summary"`
+	Body             string    `json:"body,omitempty"`
+	Actions          []Action  `json:"actions,omitempty"`
+	Urgency          Urgency   `json:"urgency"`
+	Category         string    `json:"category,omitempty"`
+	Timestamp        time.Time `json:"timestamp"`
+	ExpireTimeoutMS  int32     `json:"expire_timeout_ms"`
+	Image            *Image    `json:"image,omitempty"`
+	Value            *int32    `json:"value,omitempty"`
+	InlineReply      bool      `json:"inline_reply,omitempty"`
+	ReplyPlaceholder string    `json:"reply_placeholder,omitempty"`
+	SenderLineage    []Process `json:"sender_lineage,omitempty"`
 }
 
 type Action struct {

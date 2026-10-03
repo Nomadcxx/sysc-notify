@@ -39,7 +39,10 @@ func TestPresenterActionsAndInlineReply(t *testing.T) {
 	replyID := notify(t, client, 0, "reply", "body", map[string]dbus.Variant{
 		"x-kde-reply-placeholder-text": dbus.MakeVariant("Reply"),
 	}, 0)
-	readDelta(t, p, protocol.DeltaAdded, replyID)
+	delta := readDelta(t, p, protocol.DeltaAdded, replyID)
+	if delta.Notification == nil || delta.Notification.ReplyPlaceholder != "Reply" {
+		t.Fatalf("reply delta = %#v, want placeholder %q", delta, "Reply")
+	}
 	sendCommand(t, p, 2, protocol.Command{Kind: protocol.CommandReply, ID: replyID, Text: "answer"})
 	readReply(t, p, 2)
 	assertSignal(t, signals, "NotificationReplied", replyID, "answer")
@@ -224,7 +227,7 @@ func decodePayload(t *testing.T, envelope protocol.Envelope, destination any) {
 	}
 }
 
-func readDelta(t *testing.T, conn net.Conn, kind protocol.DeltaKind, id uint32) {
+func readDelta(t *testing.T, conn net.Conn, kind protocol.DeltaKind, id uint32) protocol.Delta {
 	t.Helper()
 	for {
 		envelope := readEnvelope(t, conn)
@@ -240,7 +243,7 @@ func readDelta(t *testing.T, conn net.Conn, kind protocol.DeltaKind, id uint32) 
 		if delta.Kind != kind || gotID != id {
 			t.Fatalf("delta = %#v, want ID %d", delta, id)
 		}
-		return
+		return delta
 	}
 }
 

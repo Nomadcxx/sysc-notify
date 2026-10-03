@@ -347,10 +347,17 @@ func (s *Server) handle(socket *net.UnixConn) {
 	s.current = c
 	s.preparing = nil
 	s.mu.Unlock()
+	var previous uint64
 	if old != nil {
 		old.fail()
-		_, _ = owner.Do(context.Background(), state.Command{Kind: state.PresenterLost, Generation: old.generation})
+		previous = old.generation
 	}
+	// Bind this generation before readLoop. PresenterLost retires the replaced
+	// generation, so commands arriving on the old generation afterwards are
+	// rejected by the generation gate.
+	_, _ = owner.Do(context.Background(), state.Command{
+		Kind: state.PresenterLost, Generation: previous, NextGeneration: c.generation,
+	})
 
 	writerStarted = true
 	go c.writeLoop()

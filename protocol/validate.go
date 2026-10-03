@@ -120,6 +120,7 @@ func (n Notification) Validate() error {
 	for name, value := range map[string]string{
 		"app name": n.AppName, "app icon": n.AppIcon, "desktop entry": n.DesktopEntry,
 		"summary": n.Summary, "body": n.Body, "category": n.Category,
+		"reply placeholder": n.ReplyPlaceholder,
 	} {
 		if err := validateText(name, value, MaxBodyBytes, true); err != nil {
 			return err
