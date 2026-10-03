@@ -276,6 +276,44 @@ func TestOwnerActionPrecedesOptionalClose(t *testing.T) {
 	}
 }
 
+func TestInlineReplyActionCanBeRepliedTo(t *testing.T) {
+	owner, sink := startTestOwner(t)
+	candidate, err := notify.Normalize(notify.Request{
+		Summary: "Message from Alice",
+		Actions: []string{"inline-reply", "Reply"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := do(t, owner, Command{Kind: Add, Candidate: candidate}).ID
+	do(t, owner, Command{Kind: SubmitReply, ID: id, ReplyText: "hello"})
+	events := sink.Events()
+	if len(events) < 2 || events[1].Reply == nil || events[1].Reply.Text != "hello" {
+		t.Fatalf("events = %#v", events)
+	}
+}
+
+func TestReplyPlaceholderIsOnTheNotification(t *testing.T) {
+	owner, _ := startTestOwner(t)
+	candidate, err := notify.Normalize(notify.Request{
+		Summary: "Message from Alice",
+		Actions: []string{"inline-reply", "Reply"},
+		Hints:   map[string]any{notify.HintInlineReplyPlaceholder: "Reply to Alice"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := do(t, owner, Command{Kind: Add, Candidate: candidate}).ID
+	got := snapshot(t, owner)
+	if len(got.Active) != 1 || got.Active[0].ID != id {
+		t.Fatalf("snapshot = %#v", got)
+	}
+	notification := got.Active[0]
+	if !notification.InlineReply || notification.ReplyPlaceholder != "Reply to Alice" {
+		t.Fatalf("notification = %#v", notification)
+	}
+}
+
 func TestStalePresenterCommandsDoNotMutate(t *testing.T) {
 	clock := newManualClock()
 	store, err := history.OpenAt(t.TempDir(), clock.Now())

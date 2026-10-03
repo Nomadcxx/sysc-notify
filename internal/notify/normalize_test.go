@@ -70,6 +70,39 @@ func TestNormalizeFields(t *testing.T) {
 	}
 }
 
+func TestNormalizeInlineReplyActionEnablesReplyWithoutHint(t *testing.T) {
+	got, err := Normalize(Request{
+		Summary: "Message from Alice",
+		Actions: []string{"inline-reply", "Reply"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.InlineReply {
+		t.Fatal("inline-reply action did not enable reply")
+	}
+	if got.ReplyPlaceholder != "" {
+		t.Fatalf("ReplyPlaceholder = %q, want empty without the hint", got.ReplyPlaceholder)
+	}
+	if len(got.Actions) != 1 || got.Actions[0].Key != "inline-reply" || got.Actions[0].Label != "Reply" {
+		t.Fatalf("Actions = %#v", got.Actions)
+	}
+}
+
+func TestNormalizeInlineReplyHintRemainsPlaceholderSource(t *testing.T) {
+	got, err := Normalize(Request{
+		Summary: "Message from Alice",
+		Actions: []string{"inline-reply", "Reply"},
+		Hints:   map[string]any{HintInlineReplyPlaceholder: "Reply to Alice"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.InlineReply || got.ReplyPlaceholder != "Reply to Alice" {
+		t.Fatalf("candidate = %#v", got)
+	}
+}
+
 func TestNormalizeImagePathFallback(t *testing.T) {
 	const path = "/usr/share/icons/hicolor/48x48/apps/example.png"
 	got, err := Normalize(Request{Hints: map[string]any{"image-path": path}})

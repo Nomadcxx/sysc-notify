@@ -1,6 +1,24 @@
 package protocol
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestNotificationRejectsOversizedReplyPlaceholder(t *testing.T) {
+	notification := Notification{
+		ID: 1, Summary: "chat", Timestamp: time.Unix(0, 0).UTC(), Urgency: UrgencyNormal,
+		ReplyPlaceholder: strings.Repeat("a", MaxBodyBytes+1),
+	}
+	if err := notification.Validate(); err == nil {
+		t.Fatal("oversized reply placeholder accepted")
+	}
+	notification.ReplyPlaceholder = "Reply to Alice"
+	if err := notification.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestValidateHistoryRemoveRequiresIDs(t *testing.T) {
 	if err := (Command{Kind: CommandHistoryRemove}).Validate(); err == nil {

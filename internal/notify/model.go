@@ -11,6 +11,7 @@ const (
 	HintPrivate                = "x-sysc-private"
 	HintResident               = "resident"
 	HintInlineReplyPlaceholder = "x-kde-reply-placeholder-text"
+	ActionInlineReply          = "inline-reply"
 	HintImageData              = "image-data"
 	HintImagePath              = "image-path"
 )
