@@ -189,3 +189,104 @@ func TestConcurrentMutationsFlush(t *testing.T) {
 		}
 	}
 }
+
+func TestCloseWaitsForConcurrentCloseAndFlush(t *testing.T) {
+	store := &Store{
+		writeGen:   1,
+		closing:    make(chan struct{}),
+		workerDone: make(chan struct{}),
+		closeDone:  make(chan struct{}),
+	}
+	store.cond = sync.NewCond(&store.mu)
+	var releaseWorker sync.Once
+	release := func() { releaseWorker.Do(func() { close(store.workerDone) }) }
+	t.Cleanup(release)
+
+	// Hold the mutex long enough to queue Flush, then reacquire it after the
+	// waiter enters cond.Wait so Close cannot race ahead of its registration.
+	store.mu.Lock()
+	flushStarted := make(chan struct{})
+	flushDone := make(chan error, 1)
+	go func() {
+		close(flushStarted)
+		flushDone <- store.Flush()
+	}()
+	<-flushStarted
+	time.Sleep(10 * time.Millisecond)
+	store.mu.Unlock()
+	store.mu.Lock()
+	store.mu.Unlock()
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- store.Close() }()
+	deadline := time.After(time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		store.mu.Lock()
+		closed := store.closed
+		store.mu.Unlock()
+		if closed {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("Close did not begin")
+		case <-ticker.C:
+		}
+	}
+
+	secondCloseDone := make(chan error, 1)
+	secondCloseStarted := make(chan struct{})
+	go func() {
+		close(secondCloseStarted)
+		secondCloseDone <- store.Close()
+	}()
+	<-secondCloseStarted
+	secondReturnedEarly := false
+	select {
+	case <-secondCloseDone:
+		secondReturnedEarly = true
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	writeErr := errors.New("worker persistence failed")
+	store.mu.Lock()
+	store.lastErr = writeErr
+	store.mu.Unlock()
+	release()
+	select {
+	case err := <-closeDone:
+		if !errors.Is(err, writeErr) {
+			t.Fatalf("Close = %v, want %v", err, writeErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish after the worker stopped")
+	}
+	if !secondReturnedEarly {
+		select {
+		case err := <-secondCloseDone:
+			if !errors.Is(err, writeErr) {
+				t.Errorf("second Close = %v, want %v", err, writeErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("second Close did not return")
+		}
+	} else {
+		t.Error("second Close returned before the first close finished")
+	}
+
+	select {
+	case err := <-flushDone:
+		if !errors.Is(err, writeErr) {
+			t.Errorf("Flush = %v, want %v", err, writeErr)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Flush stayed blocked after Close finished")
+		store.mu.Lock()
+		store.workerGen = store.writeGen
+		store.cond.Broadcast()
+		store.mu.Unlock()
+		<-flushDone
+	}
+}
