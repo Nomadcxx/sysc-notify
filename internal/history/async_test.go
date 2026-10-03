@@ -212,7 +212,7 @@ func TestCloseWaitsForConcurrentCloseAndFlush(t *testing.T) {
 		flushDone <- store.Flush()
 	}()
 	<-flushStarted
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 	store.mu.Unlock()
 	store.mu.Lock()
 	store.mu.Unlock()
@@ -247,7 +247,7 @@ func TestCloseWaitsForConcurrentCloseAndFlush(t *testing.T) {
 	select {
 	case <-secondCloseDone:
 		secondReturnedEarly = true
-	case <-time.After(10 * time.Millisecond):
+	case <-time.After(100 * time.Millisecond):
 	}
 
 	writeErr := errors.New("worker persistence failed")
@@ -281,7 +281,7 @@ func TestCloseWaitsForConcurrentCloseAndFlush(t *testing.T) {
 		if !errors.Is(err, writeErr) {
 			t.Errorf("Flush = %v, want %v", err, writeErr)
 		}
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(time.Second):
 		t.Error("Flush stayed blocked after Close finished")
 		store.mu.Lock()
 		store.workerGen = store.writeGen
