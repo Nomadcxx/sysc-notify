@@ -35,7 +35,6 @@ type Store struct {
 	mu        sync.Mutex
 	cond      *sync.Cond
 	entries   []protocol.HistoryEntry // authoritative in-memory state
-	pending   []protocol.HistoryEntry // durable target for the next commit
 	dirty     bool
 	writeGen  int // incremented by every mutation
 	workerGen int // generation durably committed (or attempted)
@@ -134,12 +133,18 @@ func (s *Store) persistLoop() {
 			return
 		}
 		if s.dirty {
-			target := s.pending
+			// Snapshot the authoritative state here, on the worker, rather than
+			// on every mutation: the entries are replaced wholesale (never
+			// mutated in place), so reading them under the lock is enough, and
+			// coalesced bursts clone once instead of once per mutation.
+			target := cloneEntries(s.entries)
 			gen := s.writeGen
 			s.dirty = false
 			s.mu.Unlock()
 			if err := s.commit(target); err != nil {
 				s.recordErr(err)
+			} else {
+				s.clearErr()
 			}
 			s.mu.Lock()
 			if gen > s.workerGen {
@@ -166,11 +171,20 @@ func (s *Store) recordErr(err error) {
 	s.mu.Unlock()
 }
 
-// schedule marks the current in-memory entries as the next durable target.
+// clearErr drops a remembered error once a later commit succeeds, so a
+// transient failure during a burst does not make every later Flush and Close
+// report an error that has since been resolved.
+func (s *Store) clearErr() {
+	s.mu.Lock()
+	s.lastErr = nil
+	s.mu.Unlock()
+}
+
+// schedule marks the store dirty and wakes the persistence worker. The worker
+// snapshots the entries when it wakes, so no per-mutation copy is needed.
 // Callers hold s.mu.
 func (s *Store) schedule() {
 	s.writeGen++
-	s.pending = cloneEntries(s.entries)
 	s.dirty = true
 	select {
 	case s.wake <- struct{}{}:
@@ -200,13 +214,18 @@ func (s *Store) Close() error {
 	}
 	s.closed = true
 	dirty := s.dirty
-	target := s.pending
+	var target []protocol.HistoryEntry
+	if dirty {
+		target = cloneEntries(s.entries)
+	}
 	s.mu.Unlock()
 	close(s.closing)
 	<-s.workerDone
 	if dirty {
 		if err := s.commit(target); err != nil {
 			s.recordErr(err)
+		} else {
+			s.clearErr()
 		}
 	}
 	s.mu.Lock()

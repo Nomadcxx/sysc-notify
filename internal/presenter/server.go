@@ -41,6 +41,7 @@ type Server struct {
 	preparing  *connection
 	nextGen    uint64
 	started    bool
+	closing    bool
 
 	stop      chan struct{}
 	done      chan error
@@ -103,6 +104,7 @@ func (s *Server) Close() error {
 		close(s.stop)
 		s.mu.Lock()
 		listener, current, preparing, path := s.listener, s.current, s.preparing, s.socketPath
+		s.closing = true
 		s.mu.Unlock()
 		if listener != nil {
 			result = errors.Join(result, listener.Close())
@@ -142,7 +144,7 @@ func (s *Server) Publish(event state.Event) bool {
 	s.mu.Lock()
 	preparing, current := s.preparing, s.current
 	var prepared, published = true, true
-	var resync bool
+	var resync, plannedResync bool
 	var resyncGeneration uint64
 	if preparing != nil {
 		prepared = preparing.prepare(message)
@@ -151,13 +153,24 @@ func (s *Server) Publish(event state.Event) bool {
 		published, resync = current.enqueueDelta(message)
 		if resync {
 			resyncGeneration = current.generation
+			// Register the resync goroutine while still holding s.mu so it
+			// cannot race Server.Close's wg.Wait. A resync requested as the
+			// server is shutting down is dropped, not spawned: the owner is
+			// about to close and the connection is being failed anyway.
+			if !s.closing {
+				s.wg.Add(1)
+				plannedResync = true
+			}
 		}
 	}
 	s.mu.Unlock()
-	if resync {
+	if plannedResync {
 		// Ask the owner off the Publish path: Publish is called by the owner
 		// goroutine, and requestResync calls Owner.Do, which would deadlock.
-		go s.requestResync(resyncGeneration)
+		go func() {
+			defer s.wg.Done()
+			s.requestResync(resyncGeneration)
+		}()
 	}
 	return prepared && published
 }

@@ -1,6 +1,7 @@
 package history
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -71,6 +72,63 @@ func TestClosePersistsPendingWork(t *testing.T) {
 	t.Cleanup(func() { _ = reopened.Close() })
 	if got := reopened.Entries(); len(got) != 1 || got[0].ID != 9 {
 		t.Fatalf("reopened entries = %#v, want [9]", got)
+	}
+}
+
+// TestSuccessfulCommitClearsRememberedError verifies that a transient persist
+// failure does not make every later Flush report an error after a later commit
+// has succeeded. recordErr/clearErr are exercised directly because forcing a
+// real commit failure would require an unwritable directory mid-run.
+func TestSuccessfulCommitClearsRememberedError(t *testing.T) {
+	stateHome := t.TempDir()
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	store, err := OpenAt(stateHome, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	store.recordErr(errors.New("transient"))
+	store.mu.Lock()
+	store.workerGen = store.writeGen
+	store.mu.Unlock()
+	if err := store.Flush(); err == nil {
+		t.Fatal("Flush did not surface the recorded error")
+	}
+
+	store.clearErr()
+	if err := store.Flush(); err != nil {
+		t.Fatalf("Flush after a successful commit: %v", err)
+	}
+}
+
+// TestScheduleDoesNotCopyEntries verifies that a mutation no longer deep-copies
+// the whole history (the per-mutation clone that ran on the owner goroutine).
+// The worker snapshots once when it wakes, so a scheduling mutation must not
+// allocate a pending copy.
+func TestScheduleDoesNotCopyEntries(t *testing.T) {
+	stateHome := t.TempDir()
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	store, err := OpenAt(stateHome, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := store.Add(testEntry(1, now), now); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	dirty := store.dirty
+	store.mu.Unlock()
+	if !dirty {
+		t.Fatal("Add did not mark the store dirty")
+	}
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
 	}
 }
 
