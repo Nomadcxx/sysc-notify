@@ -3,9 +3,14 @@ package presenter
 import (
 	"context"
 	"net"
+	"os"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/Nomadcxx/sysc-notify/internal/history"
 	"github.com/Nomadcxx/sysc-notify/internal/notify"
@@ -135,6 +140,77 @@ func TestMalformedMessagesAndSequenceGapsReconnectCleanly(t *testing.T) {
 	assertSocketClosed(t, client.conn)
 	reconnected := connectPresenter(t, h.server.SocketPath())
 	_ = reconnected.conn.Close()
+}
+
+func TestFailDropsCommandBlockedOnOwner(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	sink := funcSink(func(event state.Event) bool {
+		if event.Delta != nil && event.Delta.Notification != nil && event.Delta.Notification.Summary == "blocker" {
+			once.Do(func() {
+				close(started)
+				<-release
+			})
+		}
+		return true
+	})
+	owner := state.Start(newPresenterClock(), sink)
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		_ = owner.Close()
+	})
+
+	id := addCandidate(t, owner, "keep", 0)
+	doState(t, owner, state.Command{
+		Kind: state.PresentationRenew, Generation: 1,
+		Presentations: []protocol.Presentation{{ID: id, State: protocol.PresentationQueued}},
+	})
+	blockerDone := make(chan struct{})
+	go func() {
+		defer close(blockerDone)
+		_, _ = owner.Do(context.Background(), state.Command{Kind: state.Add, Candidate: notify.Candidate{
+			Summary: "blocker", Urgency: protocol.UrgencyNormal,
+		}})
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("owner did not block in publish")
+	}
+
+	client, server := unixPair(t)
+	defer client.Close()
+	conn := newConnection(server, 1)
+	defer conn.fail()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn.readLoop(owner)
+	}()
+	if err := writeEnvelope(client, protocol.KindCommand, 1, 0, protocol.Command{Kind: protocol.CommandDismiss, ID: id}); err != nil {
+		t.Fatal(err)
+	}
+	waitForStack(t, "(*connection).readLoop", "(*Owner).Do")
+	conn.fail()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("failed connection left its command blocked in Do")
+	}
+	close(release)
+	select {
+	case <-blockerDone:
+	case <-time.After(time.Second):
+		t.Fatal("owner did not finish the blocked publish")
+	}
+	if !activeIDs(snapshotOwner(t, owner), id) {
+		t.Fatal("command blocked on the replaced connection still dismissed the notification")
+	}
 }
 
 func TestExecuteHistoryRemoveReachesState(t *testing.T) {
@@ -308,6 +384,55 @@ func historyIDs(snapshot protocol.Snapshot, ids ...uint32) bool {
 		}
 	}
 	return true
+}
+
+type funcSink func(state.Event) bool
+
+func (f funcSink) Publish(event state.Event) bool { return f(event) }
+
+func unixPair(t *testing.T) (*net.UnixConn, *net.UnixConn) {
+	t.Helper()
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return unixConn(t, fds[0]), unixConn(t, fds[1])
+}
+
+func unixConn(t *testing.T, fd int) *net.UnixConn {
+	t.Helper()
+	file := os.NewFile(uintptr(fd), "unix")
+	defer file.Close()
+	conn, err := net.FileConn(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unixConn, ok := conn.(*net.UnixConn)
+	if !ok {
+		_ = conn.Close()
+		t.Fatal("socketpair is not a unix connection")
+	}
+	return unixConn
+}
+
+func waitForStack(t *testing.T, fragments ...string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	buf := make([]byte, 1<<20)
+	for time.Now().Before(deadline) {
+		n := runtime.Stack(buf, true)
+		for _, stack := range strings.Split(string(buf[:n]), "\n\n") {
+			found := true
+			for _, fragment := range fragments {
+				found = found && strings.Contains(stack, fragment)
+			}
+			if found {
+				return
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for a goroutine containing %q", fragments)
 }
 
 func waitNoPresenter(t *testing.T, server *Server) {

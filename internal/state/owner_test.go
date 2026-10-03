@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -310,6 +311,70 @@ func TestReplyPlaceholderIsOnTheNotification(t *testing.T) {
 	notification := got.Active[0]
 	if !notification.InlineReply || notification.ReplyPlaceholder != "Reply to Alice" {
 		t.Fatalf("notification = %#v", notification)
+	}
+}
+
+func TestStalePresenterCommandsDoNotMutate(t *testing.T) {
+	clock := newManualClock()
+	store, err := history.OpenAt(t.TempDir(), clock.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := newEventSink()
+	owner := StartWithHistory(clock, sink, store)
+	t.Cleanup(func() { _ = owner.Close() })
+
+	closedID := do(t, owner, Command{Kind: Add, Candidate: candidate("closed", time.Minute)}).ID
+	do(t, owner, Command{Kind: Dismiss, ID: closedID})
+	live := candidate("live", time.Minute)
+	live.Resident = true
+	live.InlineReply = true
+	live.Actions = []protocol.Action{{Key: "open", Label: "Open"}}
+	liveID := do(t, owner, Command{Kind: Add, Candidate: live}).ID
+	do(t, owner, Command{
+		Kind: PresentationRenew, Generation: 2,
+		Presentations: []protocol.Presentation{{ID: liveID, State: protocol.PresentationQueued}},
+	})
+	producer := do(t, owner, Command{Kind: ProducerPublish, Producer: &protocol.ProducerRequest{
+		Key: "sysc-shell:battery-low", Summary: "Battery low",
+	}})
+
+	stale := []Command{
+		{Kind: Dismiss, ID: liveID, Generation: 1},
+		{Kind: InvokeAction, ID: liveID, ActionKey: "open", Generation: 1},
+		{Kind: SubmitReply, ID: liveID, ReplyText: "nope", Generation: 1},
+		{Kind: DismissAll, Generation: 1},
+		{Kind: HistoryClear, Generation: 1},
+		{Kind: HistoryRemove, IDs: []uint32{closedID}, Generation: 1},
+		{Kind: HistoryMarkSeen, IDs: []uint32{closedID}, Generation: 1},
+		{Kind: ProducerPublish, Generation: 1, Producer: &protocol.ProducerRequest{Key: "sysc-shell:battery-full", Summary: "Full"}},
+		{Kind: ProducerClose, Generation: 1, Producer: &protocol.ProducerRequest{Key: "sysc-shell:battery-low"}},
+	}
+	before := len(sink.Events())
+	for _, command := range stale {
+		_, err := owner.Do(context.Background(), command)
+		if !errors.Is(err, ErrStale) {
+			t.Fatalf("%v error = %v, want ErrStale", command.Kind, err)
+		}
+	}
+	if got := len(sink.Events()); got != before {
+		t.Fatalf("stale commands published %d events", got-before)
+	}
+	got := snapshot(t, owner)
+	if !hasID(got, liveID) || !hasID(got, producer.ID) || !historyHasID(got, closedID) {
+		t.Fatalf("snapshot after stale commands = %#v", got)
+	}
+	for _, entry := range got.History {
+		if entry.ID == closedID && entry.Seen {
+			t.Fatal("stale mark-seen changed history")
+		}
+	}
+
+	do(t, owner, Command{Kind: InvokeAction, ID: liveID, ActionKey: "open", Generation: 2})
+	do(t, owner, Command{Kind: HistoryMarkSeen, IDs: []uint32{closedID}, Generation: 2})
+	do(t, owner, Command{Kind: Dismiss, ID: liveID})
+	if hasID(snapshot(t, owner), liveID) {
+		t.Fatal("ungenerated service dismiss was rejected")
 	}
 }
 
