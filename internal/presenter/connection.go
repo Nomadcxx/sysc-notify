@@ -148,8 +148,8 @@ func (c *connection) fail() {
 		if c.socket != nil {
 			_ = c.socket.Close()
 		}
-		// Unblock owner.Do that has not been received yet. A command already
-		// inside the owner is rejected separately if its generation is stale.
+		// Unblock owner.Do calls not yet received by the owner; commands
+		// arriving after PresenterLost are rejected by the generation gate.
 		c.cancel()
 	})
 }

@@ -285,8 +285,8 @@ func (s *Server) handle(socket *net.UnixConn) {
 		previous = old.generation
 	}
 	// Bind this generation before readLoop. PresenterLost retires the replaced
-	// generation in the same owner turn, so a command still blocked in Do
-	// cannot renew the old lease or dismiss a live notification afterwards.
+	// generation, so commands arriving on the old generation afterwards are
+	// rejected by the generation gate.
 	_, _ = owner.Do(context.Background(), state.Command{
 		Kind: state.PresenterLost, Generation: previous, NextGeneration: c.generation,
 	})
