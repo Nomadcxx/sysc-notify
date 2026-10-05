@@ -20,7 +20,16 @@ import (
 const (
 	historyFilename     = "history.json"
 	maxHistoryJSONBytes = 8 << 20
+	// maxHistoryWriteBytes leaves headroom below the read limit for the
+	// document to grow by a few bytes (seen flags) after the last Add, so the
+	// daemon never writes a file its own read path would reject.
+	maxHistoryWriteBytes = maxHistoryJSONBytes - 256
 )
+
+// errFileTooLarge marks a committed file that exceeds the read limit. Unlike
+// other read failures it is recoverable: the file is quarantined and the
+// daemon starts with empty history.
+var errFileTooLarge = errors.New("history: file exceeds size limit")
 
 // Store keeps the retained history in memory as the authoritative state and
 // persists it on a background goroutine. Mutations (Add, Sweep, Remove,
@@ -92,15 +101,17 @@ func OpenAt(stateHome string, now time.Time) (*Store, error) {
 		go store.persistLoop()
 		return store, nil
 	}
-	if err != nil {
+	if err != nil && !errors.Is(err, errFileTooLarge) {
 		return nil, fmt.Errorf("history: read: %w", err)
 	}
 	var doc document
-	decoder := json.NewDecoder(bytes.NewReader(contents))
-	decoder.DisallowUnknownFields()
-	if err = decoder.Decode(&doc); err == nil {
-		if err = requireEOF(decoder); err == nil {
-			store.entries, err = decodeDocument(doc, imageDir)
+	if err == nil {
+		decoder := json.NewDecoder(bytes.NewReader(contents))
+		decoder.DisallowUnknownFields()
+		if err = decoder.Decode(&doc); err == nil {
+			if err = requireEOF(decoder); err == nil {
+				store.entries, err = decodeDocument(doc, imageDir)
+			}
 		}
 	}
 	if err != nil {
@@ -290,10 +301,37 @@ func (s *Store) Add(entry protocol.HistoryEntry, now time.Time) (protocol.Histor
 		removed = append(removed, next[0].ID)
 		next = next[1:]
 	}
+	next, budgetRemoved := trimToBudget(next)
+	removed = append(removed, budgetRemoved...)
 	s.entries = next
 	s.schedule()
 	s.mu.Unlock()
 	return cloneEntry(entry), removed, nil
+}
+
+// trimToBudget drops the oldest entries until the encoded document fits the
+// write budget. Without it a history of large escaped bodies could exceed the
+// read limit and be quarantined on the next start.
+func trimToBudget(entries []protocol.HistoryEntry) ([]protocol.HistoryEntry, []uint32) {
+	var removed []uint32
+	for len(entries) > 0 {
+		contents, err := json.Marshal(encodeDocument(entries))
+		if err != nil || len(contents)+1 <= maxHistoryWriteBytes {
+			return entries, removed
+		}
+		drop := (len(contents) + 1 - maxHistoryWriteBytes) / (len(contents) / len(entries))
+		if drop < 1 {
+			drop = 1
+		}
+		if drop > len(entries) {
+			drop = len(entries)
+		}
+		for _, entry := range entries[:drop] {
+			removed = append(removed, entry.ID)
+		}
+		entries = entries[drop:]
+	}
+	return entries, removed
 }
 
 func (s *Store) Sweep(now time.Time) ([]uint32, error) {
@@ -452,7 +490,7 @@ func readPrivateRegularFile(path string, limit int64) ([]byte, error) {
 		return nil, fmt.Errorf("history: unsafe file %q", path)
 	}
 	if info.Size() > limit {
-		return nil, fmt.Errorf("history: file %q exceeds %d bytes", path, limit)
+		return nil, fmt.Errorf("%w: %q exceeds %d bytes", errFileTooLarge, path, limit)
 	}
 	return os.ReadFile(path)
 }
