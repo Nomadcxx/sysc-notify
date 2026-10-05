@@ -447,3 +447,25 @@ type emitFunc func(path dbus.ObjectPath, name string, values ...any) error
 func (f emitFunc) Emit(path dbus.ObjectPath, name string, values ...any) error {
 	return f(path, name, values...)
 }
+
+func TestNotifyWithoutResolvableSenderPIDStillCreatesNotification(t *testing.T) {
+	h := startHarness(t, nil)
+	e := endpoint{server: h.server}
+	id, busErr := e.Notify(dbus.Sender(":1.999999"), "app", 0, "", "fire", "body", nil, nil, 0)
+	if busErr != nil {
+		t.Fatalf("Notify with unresolvable sender failed: %v", busErr)
+	}
+	if id == 0 {
+		t.Fatal("Notify returned id 0")
+	}
+	snapshot, err := h.owner.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Active) != 1 || snapshot.Active[0].ID != id || snapshot.Active[0].Summary != "fire" {
+		t.Fatalf("active snapshot = %#v", snapshot.Active)
+	}
+	if len(snapshot.Active[0].SenderLineage) != 0 {
+		t.Fatalf("sender lineage = %#v, want empty", snapshot.Active[0].SenderLineage)
+	}
+}

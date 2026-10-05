@@ -1,6 +1,7 @@
 package history
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -100,5 +101,37 @@ func TestOrphansWaitForValidCommitAndInterruptedTempIsIgnored(t *testing.T) {
 	after, err := os.ReadFile(filepath.Join(dir, historyFilename))
 	if err != nil || string(after) != string(committed) {
 		t.Fatalf("committed history changed: %v", err)
+	}
+}
+
+func TestOversizedHistoryIsQuarantined(t *testing.T) {
+	stateHome := t.TempDir()
+	dir := filepath.Join(stateHome, "sysc-notify")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	contents := bytes.Repeat([]byte("x"), maxHistoryJSONBytes+1)
+	historyPath := filepath.Join(dir, historyFilename)
+	if err := os.WriteFile(historyPath, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenAt(stateHome, time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("oversized history blocked startup: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if len(store.Entries()) != 0 {
+		t.Fatalf("oversized history loaded: %#v", store.Entries())
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, "history.quarantine-*.json"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("quarantine matches = %v, %v", matches, err)
+	}
+	got, err := os.ReadFile(matches[0])
+	if err != nil || !bytes.Equal(got, contents) {
+		t.Fatalf("quarantine contents = %d bytes, %v", len(got), err)
+	}
+	if _, err := os.Stat(historyPath); !os.IsNotExist(err) {
+		t.Fatalf("oversized history path remains: %v", err)
 	}
 }
