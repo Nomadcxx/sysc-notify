@@ -1,35 +1,88 @@
-<p align="center">
-  <img src="assets/header.png" width="920" alt="sysc-notify" />
-</p>
+<p align="center"><img src="assets/wordmark.png" alt="sysc-notify" height="120"></p>
 
-A notification daemon for Linux, written in Go. It owns `org.freedesktop.Notifications` on the
-session bus and hands every notification to [sysc-shell](https://github.com/Nomadcxx/sysc-shell),
-which draws the popups, the notification centre and the history.
+<p align="center"><strong>A notification daemon for Wayland, written in Go.</strong></p>
 
-The daemon has no windows of its own. It keeps the state: what is active, when it expires, and what
-went into history. When the shell restarts, it picks up exactly where it left off.
+<p align="center">Owns <code>org.freedesktop.Notifications</code>, implements the Freedesktop spec, and hands the notifications to sysc-shell to draw.</p>
+
+## What it is
+
+sysc-notify is the notification daemon behind [sysc-shell](https://github.com/Nomadcxx/sysc-shell).
+It claims the `org.freedesktop.Notifications` name on the session bus, so every app that sends a
+notification talks to it. It keeps the notification state — active popups, expiry, history — and
+streams it to the shell over a private Unix socket. The shell draws the popups and sends back what
+you clicked.
+
+The daemon keeps notification state across shell restarts and sends a snapshot when the shell
+reconnects. Snapshot images may be omitted to fit the frame-size limit.
+
+## How it fits together
+
+```mermaid
+flowchart LR
+    greet["sysc-greet<br/>graphical greeter"] -->|starts configured session| shell["sysc-shell<br/>desktop shell"]
+
+    subgraph session["Session"]
+        lock["sysc-lock<br/>session locker"]
+    end
+
+    subgraph daemons["Companion daemons"]
+        notify["sysc-notify<br/>notifications"]
+        clipboard["sysc-clipboard<br/>clipboard history"]
+        tray["sysc-tray<br/>system tray"]
+    end
+
+    subgraph wallpaper["Wallpaper and idle"]
+        gslapper["gSlapper<br/>video wallpaper"]
+        terminal["sysc-terminal<br/>terminal effects"]
+        walls["sysc-walls<br/>idle screensaver"]
+    end
+
+    subgraph libs["Shared Go libraries"]
+        wayland["sysc-wayland<br/>Wayland transport"]
+        launch["sysc-launch<br/>app launcher"]
+        metrics["sysc-metrics<br/>system telemetry"]
+    end
+
+    plugins["sysc-plugins<br/>plugin source"]
+
+    shell -->|spawns| session
+    shell -->|connects to| daemons
+    shell -->|drives| wallpaper
+    shell -->|links| libs
+    shell -->|installs from| plugins
+
+    classDef current fill:#7aa2f7,stroke:#1a1b26,color:#1a1b26,stroke-width:2px
+    class notify current
+```
+
+[The sysc ecosystem](https://github.com/Nomadcxx/sysc-shell/blob/main/docs/ecosystem.md) explains
+each connection, socket and version pin.
 
 ## Features
 
-- **Freedesktop spec 1.3**: replacement IDs, expiry, actions, close reasons and the
-  `NotificationClosed` / `ActionInvoked` signals
-- **Inline replies**: the KDE `x-kde-reply-placeholder-text` hint and the `NotificationReplied`
-  signal, so chat apps can take a reply from the popup
-- **Images**: `image-data`, the older `image_data` / `icon_data` aliases, and `image-path` as a
-  file path, a `file://` URI or a theme icon name. Large images are scaled to 512 px, and a
-  malformed image is dropped rather than the notification
-- **Progress and urgency**: the `value` hint for progress bars. When more than 128 notifications are
-  active at once, the oldest non-critical one makes room
-- **History**: up to 100 closed notifications, kept for 7 days and saved across restarts. Transient
-  notifications, and ones marked `x-sysc-private`, are never written to disk
-- **Survives the shell**: notifications keep arriving while the shell is down or restarting, and it
-  gets the full state back when it reconnects
-- **Sender tracking**: records which process sent a notification, so clicking it can focus the
-  sender's Niri window. If more than one window matches, the shell focuses none rather than guess
+- **Freedesktop Notifications spec 1.3**: replacement IDs, expiry, actions, close reasons, and the
+  `NotificationClosed`, `ActionInvoked` and `NotificationReplied` signals
+- **Inline replies**: advertises `inline-reply` and honours `x-kde-reply-placeholder-text`
+- **Images**: `image-data`, `image_data` and `icon_data`, scaled to a 512 px long edge;
+  `image-path` forwards an icon name or absolute path
+- **Progress and urgency**: the `value` hint accepts integers from 0–100 and rejects other values; urgency is preserved
+- **History**: up to 100 closed notifications for 7 days, with seen/unseen state; transient and
+  private notifications are excluded
+- **Survives shell restarts**: the presenter socket is independent of D-Bus, and every reconnect
+  gets a state snapshot
+- **Sender tracking**: records the sending process and its ancestry, so the shell can focus the
+  right window
+- **Plugin toasts**: a producer protocol lets shell plugins publish and close their own notifications
+- **Hardened socket**: `0600` in a `0700` directory, same-UID peer check, symlink rejection, stale
+  socket cleanup
+- **Bounded resources**: 128 active notifications, 16 KiB bodies, 6 action pairs, 64 hints, and
+  size caps on images and frames
 
-## Installation
+## Install
 
-**Requires:** Go 1.26+ and a D-Bus session bus.
+### Requirements
+
+Go 1.26+ and a D-Bus session bus.
 
 ### From source
 
@@ -37,15 +90,17 @@ went into history. When the shell restarts, it picks up exactly where it left of
 git clone https://github.com/Nomadcxx/sysc-notify
 cd sysc-notify
 go build -o ~/.local/bin/sysc-notify ./cmd/sysc-notify
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-### Via Go
+Or:
 
 ```bash
 GOBIN="$HOME/.local/bin" go install github.com/Nomadcxx/sysc-notify/cmd/sysc-notify@latest
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-### Run it as a user service
+### As a user service
 
 ```bash
 install -Dm644 contrib/sysc-notify.service ~/.config/systemd/user/sysc-notify.service
@@ -53,60 +108,30 @@ systemctl --user daemon-reload
 systemctl --user enable --now sysc-notify.service
 ```
 
-> Only one program can own the notification bus name. Stop mako, dunst, swaync or whatever you
-> ran before, or sysc-notify exits at startup and systemd keeps restarting it. A daemon that is
-> D-Bus activatable (xfce4-notifyd ships that way) can also grab the name if a notification arrives
-> before sysc-notify is up.
-
-Check which process owns the name:
-
-```bash
-busctl --user status org.freedesktop.Notifications | grep -E '^(PID|Comm)='
-```
+> **Warning**: stop mako, dunst or swaync first. Only one process can own
+> `org.freedesktop.Notifications`, and D-Bus activation may start another daemon behind your back.
 
 ## Usage
 
-Anything that sends desktop notifications works as-is:
+sysc-notify has no CLI flags; it runs as a daemon. The shell connects to
+`$XDG_RUNTIME_DIR/sysc-notify/presenter.v1.sock` and speaks length-prefixed JSON frames. The
+wire protocol is version 1.2; `v1` in the socket name denotes the major version. The protocol
+package is public:
 
-```bash
-notify-send "Build finished" "All tests passed"
-notify-send -i dialog-information -u critical "Disk almost full"
-```
-
-sysc-shell shows them as popups and keeps closed ones in its notification history. The daemon takes
-no flags. It needs `XDG_RUNTIME_DIR`, and it stops cleanly on `SIGINT` or `SIGTERM`.
-
-| What | Where |
-|---|---|
-| Shell socket | `$XDG_RUNTIME_DIR/sysc-notify/presenter.v1.sock` |
-| History | `$XDG_STATE_HOME/sysc-notify/history.json` (`~/.local/state/sysc-notify/` when unset) |
-| Logs | `journalctl --user -u sysc-notify` |
-
-## Writing a presenter
-
-sysc-shell is one client of the presenter socket, not the only possible one. The wire types live in
-the public `protocol` package:
+Run inside an existing Go module:
 
 ```bash
 go get github.com/Nomadcxx/sysc-notify/protocol
 ```
 
-A presenter connects, sends a hello, and gets a snapshot of every active notification and the
-history, then a stream of changes. It reports what it is showing so expiry pauses while you hover a
-popup. A second presenter that connects replaces the first. The types in `protocol/` are the
-reference.
+## Documentation
 
-## Development
-
-```bash
-go vet ./...
-go test -race -count=1 ./...
-dbus-run-session -- go test -race -count=1 ./tests/integration/
-```
+- [The sysc ecosystem](https://github.com/Nomadcxx/sysc-shell/blob/main/docs/ecosystem.md)
+- [sysc-shell](https://github.com/Nomadcxx/sysc-shell) — the shell that presents these notifications
 
 ## License
 
-BSD-3-Clause
+BSD-3-Clause.
 
 ---
 
