@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -376,4 +377,56 @@ func testPNG(t *testing.T, width, height int) *protocol.Image {
 		t.Fatal(err)
 	}
 	return &protocol.Image{MediaType: "image/png", Width: uint32(width), Height: uint32(height), Data: encoded.Bytes()}
+}
+
+func TestAddKeepsEncodedHistoryWithinReadLimit(t *testing.T) {
+	stateHome := t.TempDir()
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	store, err := OpenAt(stateHome, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	body := strings.Repeat("<", protocol.MaxBodyBytes)
+	trimmed := 0
+	for id := uint32(1); id <= 90; id++ {
+		entry := testEntry(id, now.Add(time.Duration(id)*time.Second))
+		entry.Body = body
+		_, removed, err := store.Add(entry, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		trimmed += len(removed)
+	}
+	if trimmed == 0 {
+		t.Fatal("no entries trimmed; the test never exceeded the read limit")
+	}
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(stateHome, "sysc-notify", historyFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() > maxHistoryJSONBytes {
+		t.Fatalf("committed history is %d bytes, over the %d read limit", info.Size(), maxHistoryJSONBytes)
+	}
+	reopened, err := OpenAt(stateHome, now)
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	got, want := reopened.Entries(), store.Entries()
+	if len(got) != len(want) {
+		t.Fatalf("reopened %d entries, want %d", len(got), len(want))
+	}
+	for i := range got {
+		if got[i].ID != want[i].ID {
+			t.Fatalf("reopened entry %d = %d, want %d", i, got[i].ID, want[i].ID)
+		}
+	}
+	matches, err := filepath.Glob(filepath.Join(stateHome, "sysc-notify", "history.quarantine-*.json"))
+	if err != nil || len(matches) != 0 {
+		t.Fatalf("history was quarantined: %v, %v", matches, err)
+	}
 }
