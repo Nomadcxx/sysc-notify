@@ -322,19 +322,10 @@ func (s *Server) handle(socket *net.UnixConn) {
 	if err != nil {
 		return
 	}
-	if err := socket.SetWriteDeadline(time.Now().Add(handshakeTimeout)); err != nil {
-		return
-	}
-	if err := protocol.WriteFrame(socket, helloFrame); err != nil {
-		return
-	}
-	if err := protocol.WriteFrame(socket, snapshotFrame); err != nil {
-		return
-	}
-	if err := socket.SetWriteDeadline(time.Time{}); err != nil {
-		return
-	}
-
+	// Commit the handoff before any client-visible byte. Writing the frames
+	// first let a peer finish its handshake while s.preparing still named this
+	// connection, so the next dial was closed as a concurrent handshake
+	// (sysc-1014: "read frame length: EOF" flakes on CI back-to-back connects).
 	s.mu.Lock()
 	if s.preparing != c || !c.activate(snapshot.Sequence) {
 		if s.preparing == c {
@@ -358,6 +349,19 @@ func (s *Server) handle(socket *net.UnixConn) {
 	_, _ = owner.Do(context.Background(), state.Command{
 		Kind: state.PresenterLost, Generation: previous, NextGeneration: c.generation,
 	})
+
+	if err := socket.SetWriteDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		return
+	}
+	if err := protocol.WriteFrame(socket, helloFrame); err != nil {
+		return
+	}
+	if err := protocol.WriteFrame(socket, snapshotFrame); err != nil {
+		return
+	}
+	if err := socket.SetWriteDeadline(time.Time{}); err != nil {
+		return
+	}
 
 	writerStarted = true
 	go c.writeLoop()

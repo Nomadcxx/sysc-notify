@@ -298,6 +298,26 @@ func TestReplacedPresenterCannotRenewOrDismiss(t *testing.T) {
 	}
 }
 
+// A peer that completes its handshake must never find the previous
+// connection's handoff still pending: sysc-1014 closed a fresh dial with
+// "read frame length: EOF" whenever the next connectPresenter landed in the
+// window between the written snapshot frame and the commit that clears
+// s.preparing.
+func TestBackToBackPresenterConnectionsKeepHandingOff(t *testing.T) {
+	h := startServerHarness(t, nil)
+	for i := range 64 {
+		first := connectPresenter(t, h.server.SocketPath())
+		second := connectPresenter(t, h.server.SocketPath())
+		if err := first.conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := protocol.ReadFrame(first.conn); err == nil {
+			t.Fatalf("iteration %d: first presenter remained connected", i)
+		}
+		_ = second.conn.Close()
+	}
+}
+
 func TestSecondPresenterReplacesGeneration(t *testing.T) {
 	h := startServerHarness(t, nil)
 	addCandidate(t, h.owner, "record", 0)
