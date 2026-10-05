@@ -1,84 +1,14 @@
-<p align="center"><img src="assets/wordmark.png" alt="sysc-notify" height="120"></p>
+![sysc-notify](assets/wordmark.png)
 
-<p align="center"><strong>A notification daemon for Wayland, written in Go.</strong></p>
+A notification daemon for sysc-shell. Implements `org.freedesktop.Notifications` on the
+session bus and streams notification state to the shell over a Unix socket.
 
-<p align="center">Owns <code>org.freedesktop.Notifications</code>, implements the Freedesktop spec, and hands the notifications to sysc-shell to draw.</p>
+## Quick Links
 
-## What it is
+- [Documentation](#documentation)
+- [The sysc ecosystem](https://github.com/Nomadcxx/sysc-shell/blob/main/docs/ecosystem.md)
 
-sysc-notify is the notification daemon behind [sysc-shell](https://github.com/Nomadcxx/sysc-shell).
-It claims the `org.freedesktop.Notifications` name on the session bus, so every app that sends a
-notification talks to it. It keeps the notification state — active popups, expiry, history — and
-streams it to the shell over a private Unix socket. The shell draws the popups and sends back what
-you clicked.
-
-The daemon keeps notification state across shell restarts and sends a snapshot when the shell
-reconnects. Snapshot images may be omitted to fit the frame-size limit.
-
-## How it fits together
-
-```mermaid
-flowchart LR
-    greet["sysc-greet<br/>graphical greeter"] -->|starts configured session| shell["sysc-shell<br/>desktop shell"]
-
-    subgraph session["Session"]
-        lock["sysc-lock<br/>session locker"]
-    end
-
-    subgraph daemons["Companion daemons"]
-        notify["sysc-notify<br/>notifications"]
-        clipboard["sysc-clipboard<br/>clipboard history"]
-        tray["sysc-tray<br/>system tray"]
-    end
-
-    subgraph wallpaper["Wallpaper and idle"]
-        gslapper["gSlapper<br/>video wallpaper"]
-        terminal["sysc-terminal<br/>terminal effects"]
-        walls["sysc-walls<br/>idle screensaver"]
-    end
-
-    subgraph libs["Shared Go libraries"]
-        wayland["sysc-wayland<br/>Wayland transport"]
-        launch["sysc-launch<br/>app launcher"]
-        metrics["sysc-metrics<br/>system telemetry"]
-    end
-
-    plugins["sysc-plugins<br/>plugin source"]
-
-    shell -->|spawns| session
-    shell -->|connects to| daemons
-    shell -->|drives| wallpaper
-    shell -->|links| libs
-    shell -->|installs from| plugins
-
-    classDef current fill:#7aa2f7,stroke:#1a1b26,color:#1a1b26,stroke-width:2px
-    class notify current
-```
-
-[The sysc ecosystem](https://github.com/Nomadcxx/sysc-shell/blob/main/docs/ecosystem.md) explains
-each connection, socket and version pin.
-
-## Features
-
-- **Freedesktop Notifications spec 1.3**: replacement IDs, expiry, actions, close reasons, and the
-  `NotificationClosed`, `ActionInvoked` and `NotificationReplied` signals
-- **Inline replies**: advertises `inline-reply` and honours `x-kde-reply-placeholder-text`
-- **Images**: `image-data`, `image_data` and `icon_data`, scaled to a 512 px long edge;
-  `image-path` forwards an icon name or absolute path
-- **Progress and urgency**: the `value` hint accepts integers from 0–100 and rejects other values; urgency is preserved
-- **History**: up to 100 closed notifications for 7 days, with seen/unseen state; transient and
-  private notifications are excluded
-- **Survives shell restarts**: the presenter socket is independent of D-Bus, and every reconnect
-  gets a state snapshot
-- **Sender tracking**: records the sending process and its ancestry, so the shell can focus the
-  right window
-- **Plugin toasts**: a producer protocol lets shell plugins publish and close their own notifications
-- **Hardened socket**: `0600` in a `0700` directory, same-UID peer check, symlink rejection, stale
-  socket cleanup
-- **Bounded resources**: 128 active notifications, 16 KiB bodies, 6 action pairs, 64 hints, and
-  size caps on images and frames
-
-## Install
+## Installation
 
 ### Requirements
 
@@ -123,6 +53,69 @@ Run inside an existing Go module:
 ```bash
 go get github.com/Nomadcxx/sysc-notify/protocol
 ```
+
+## Notification handling
+
+- **Freedesktop Notifications spec 1.3**: replacement IDs, expiry, actions, close reasons, and the
+  `NotificationClosed`, `ActionInvoked` and `NotificationReplied` signals
+- **Inline replies**: advertises `inline-reply` and honours `x-kde-reply-placeholder-text`
+- **Images**: `image-data`, `image_data` and `icon_data`, scaled to a 512 px long edge;
+  `image-path` forwards an icon name or absolute path
+- **Progress and urgency**: the `value` hint accepts integers from 0–100 and rejects other values; urgency is preserved
+- **History**: up to 100 closed notifications for 7 days, with seen/unseen state; transient and
+  private notifications are excluded
+- **Survives shell restarts**: the presenter socket is independent of D-Bus, and every reconnect
+  gets a state snapshot; snapshot images may be omitted to fit the frame-size limit
+- **Sender tracking**: records the sending process and its ancestry, so the shell can focus the
+  right window
+- **Plugin toasts**: a producer protocol lets shell plugins publish and close their own notifications
+- **Hardened socket**: `0600` in a `0700` directory, same-UID peer check, symlink rejection, stale
+  socket cleanup
+- **Bounded resources**: 128 active notifications, 16 KiB bodies, 6 action pairs, 64 hints, and
+  size caps on images and frames
+
+## Ecosystem
+
+```mermaid
+flowchart LR
+    greet["sysc-greet<br/>graphical greeter"] -->|starts configured session| shell["sysc-shell<br/>desktop shell"]
+
+    subgraph session["Session"]
+        lock["sysc-lock<br/>session locker"]
+    end
+
+    subgraph daemons["Companion daemons"]
+        notify["sysc-notify<br/>notifications"]
+        clipboard["sysc-clipboard<br/>clipboard history"]
+        tray["sysc-tray<br/>system tray"]
+    end
+
+    subgraph wallpaper["Wallpaper and idle"]
+        gslapper["gSlapper<br/>video wallpaper"]
+        terminal["sysc-terminal<br/>terminal effects"]
+        walls["sysc-walls<br/>idle screensaver"]
+    end
+
+    subgraph libs["Shared Go libraries"]
+        wayland["sysc-wayland<br/>Wayland transport"]
+        launch["sysc-launch<br/>app launcher"]
+        metrics["sysc-metrics<br/>system telemetry"]
+    end
+
+    plugins["sysc-plugins<br/>plugin source"]
+
+    shell -->|spawns| session
+    shell -->|connects to| daemons
+    shell -->|drives| wallpaper
+    shell -->|links| libs
+    shell -->|installs from| plugins
+
+    classDef current fill:#7aa2f7,stroke:#1a1b26,color:#1a1b26,stroke-width:2px
+    class notify current
+```
+
+[The sysc ecosystem](https://github.com/Nomadcxx/sysc-shell/blob/main/docs/ecosystem.md) explains
+each connection, socket and version pin.
 
 ## Documentation
 
