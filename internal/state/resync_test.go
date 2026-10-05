@@ -92,3 +92,15 @@ func TestPresenterResyncIsIdempotent(t *testing.T) {
 		t.Fatalf("resync snapshots = %d, want 3", count)
 	}
 }
+
+type rejectSink struct{}
+
+func (rejectSink) Publish(Event) bool { return false }
+
+func TestPresenterResyncErrorsWhenSnapshotIsNotPublished(t *testing.T) {
+	owner := Start(nil, rejectSink{})
+	t.Cleanup(func() { _ = owner.Close() })
+	if _, err := owner.Do(context.Background(), Command{Kind: PresenterResync, Generation: 1}); err == nil {
+		t.Fatal("undelivered resync snapshot returned success")
+	}
+}

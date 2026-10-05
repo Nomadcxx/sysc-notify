@@ -315,7 +315,12 @@ func (s *ownerState) do(command Command) (Result, error) {
 		return Result{}, s.markHistorySeen(command.IDs)
 	case PresenterResync:
 		snapshot := s.snapshot()
-		s.publish(Event{Generation: command.Generation, Sequence: snapshot.Sequence, Snapshot: &snapshot})
+		// Until this snapshot is queued, the presenter drops every later delta
+		// and will not ask again. A snapshot that cannot be published must
+		// surface here so the connection is closed instead of left wedged.
+		if !s.publish(Event{Generation: command.Generation, Sequence: snapshot.Sequence, Snapshot: &snapshot}) {
+			return Result{}, errors.New("state: presenter resync snapshot was not published")
+		}
 		return Result{}, nil
 	default:
 		return Result{}, errors.New("state: unknown command")
@@ -664,10 +669,11 @@ func (s *ownerState) publishDelta(delta protocol.Delta) {
 	s.publish(Event{Sequence: s.sequence, Delta: &delta})
 }
 
-func (s *ownerState) publish(event Event) {
-	if s.sink != nil {
-		s.sink.Publish(event)
+func (s *ownerState) publish(event Event) bool {
+	if s.sink == nil {
+		return true
 	}
+	return s.sink.Publish(event)
 }
 
 func (s *ownerState) snapshot() protocol.Snapshot {

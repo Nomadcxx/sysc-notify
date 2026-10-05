@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -509,5 +511,70 @@ func TestSnapshotWithManyWireImagesStillHandshakes(t *testing.T) {
 	}
 	if oldest := client.snapshot.Active[0]; oldest.Image != nil {
 		t.Fatal("snapshot kept the oldest image over the frame limit")
+	}
+}
+
+// A queue overflow arms resync. If the image-stripped snapshot still exceeds
+// MaxFrameSize, marshalling fails. That must close the connection. Leaving
+// resync armed with no frame drops every later delta and reports it published.
+func TestOversizedResyncSnapshotClosesConnection(t *testing.T) {
+	server := NewAt(t.TempDir())
+	owner := state.Start(nil, server)
+	t.Cleanup(func() { _ = owner.Close() })
+	server.mu.Lock()
+	server.owner = owner
+	server.mu.Unlock()
+
+	actions := make([]protocol.Action, protocol.MaxActionPairs)
+	for i := range actions {
+		actions[i] = protocol.Action{
+			Key:   fmt.Sprintf("%d-%s", i, strings.Repeat("k", protocol.MaxBodyBytes-2)),
+			Label: strings.Repeat("l", protocol.MaxBodyBytes),
+		}
+	}
+	body := strings.Repeat("b", protocol.MaxBodyBytes)
+	var lastID uint32
+	for i := range protocol.MaxActiveNotifications {
+		lastID = addFullCandidate(t, owner, notify.Candidate{
+			Summary: fmt.Sprintf("n%d", i), Body: body, Actions: actions,
+			Urgency: protocol.UrgencyNormal,
+		})
+	}
+	snap := snapshotOwner(t, owner)
+	if _, err := marshalSnapshot(snap); err == nil {
+		t.Fatal("fixture snapshot fits in a frame; resync marshalling did not fail")
+	}
+
+	current := activeConnection(1)
+	current.mu.Lock()
+	current.lastSequence = snap.Sequence
+	current.queuedMessages = protocol.MaxPresenterQueueMessages
+	current.mu.Unlock()
+	server.mu.Lock()
+	server.current = current
+	server.mu.Unlock()
+
+	if _, err := owner.Do(context.Background(), state.Command{Kind: state.Add, Candidate: notify.Candidate{
+		ReplacesID: lastID, Summary: "replaced", Body: body, Actions: actions,
+		Urgency: protocol.UrgencyNormal,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	current.mu.Lock()
+	armed := current.resyncNeeded
+	current.mu.Unlock()
+	if !armed {
+		t.Fatal("overflow did not arm resync")
+	}
+	select {
+	case <-current.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("oversized resync snapshot left the connection open")
+	}
+	if server.Publish(state.Event{
+		Sequence: snap.Sequence + 2,
+		Delta:    &protocol.Delta{Kind: protocol.DeltaClosed, ID: lastID, CloseReason: protocol.CloseUndefined},
+	}) {
+		t.Fatal("delta after a failed resync was reported as published")
 	}
 }
