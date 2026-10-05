@@ -1,8 +1,12 @@
 package presenter
 
 import (
+	"bytes"
+	"net"
 	"testing"
+	"time"
 
+	"github.com/Nomadcxx/sysc-notify/internal/state"
 	"github.com/Nomadcxx/sysc-notify/protocol"
 )
 
@@ -135,4 +139,152 @@ func TestTakeResyncDrainsQueueThenSplicesTail(t *testing.T) {
 	if published, _ := c.enqueueDelta(outbound{data: []byte{1}, sequence: baseline + 3}); !published {
 		t.Fatal("connection rejected a delta continuing the rebased baseline")
 	}
+}
+
+// A command reply must not tear down a connection whose outbound queue is
+// already full of pre-snapshot deltas. presentation.renew is the keepalive
+// that holds the expiry lease, so it has to be answered while resync can
+// still rebase. The queue is left undrained until the reply is accepted, so
+// the send hits the full-queue path rather than racing the writer.
+func TestCommandReplyWhileDeltaQueueIsFull(t *testing.T) {
+	for _, armed := range []bool{false, true} {
+		name := "at capacity"
+		if armed {
+			name = "resync armed"
+		}
+		t.Run(name, func(t *testing.T) {
+			testCommandReplyWhileDeltaQueueIsFull(t, armed)
+		})
+	}
+}
+
+func testCommandReplyWhileDeltaQueueIsFull(t *testing.T, armResync bool) {
+	t.Helper()
+	owner := state.Start(newPresenterClock(), funcSink(func(state.Event) bool { return true }))
+	t.Cleanup(func() { _ = owner.Close() })
+	id := addCandidate(t, owner, "visible", time.Minute)
+
+	client, server := unixPair(t)
+	defer client.Close()
+	conn := newConnection(server, 1)
+	if !conn.activate(0) {
+		t.Fatal("activate")
+	}
+
+	for sequence := uint64(1); sequence <= protocol.MaxPresenterQueueMessages; sequence++ {
+		published, resync := conn.enqueueDelta(outbound{data: []byte{1}, sequence: sequence})
+		if !published || resync {
+			t.Fatalf("delta %d: published=%v resync=%v", sequence, published, resync)
+		}
+	}
+	if armResync {
+		published, resync := conn.enqueueDelta(outbound{data: []byte{1}, sequence: protocol.MaxPresenterQueueMessages + 1})
+		if !published || !resync {
+			t.Fatalf("overflow: published=%v resync=%v", published, resync)
+		}
+	}
+
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		conn.readLoop(owner)
+	}()
+	writerStarted := false
+	defer func() {
+		conn.fail()
+		<-readDone
+		if writerStarted {
+			<-conn.writerDone
+		}
+	}()
+
+	command := protocol.Command{
+		Kind:          protocol.CommandPresentationRenew,
+		Presentations: []protocol.Presentation{{ID: id, State: protocol.PresentationVisible}},
+	}
+	if err := writeEnvelope(client, protocol.KindCommand, 1, 0, command); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		conn.mu.Lock()
+		held := len(conn.replyHold) > 0
+		conn.mu.Unlock()
+		if held {
+			break
+		}
+		select {
+		case <-conn.closed:
+			t.Fatal("renew closed the connection while the delta queue was full")
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("reply was not accepted onto a full delta queue")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-conn.closed:
+		t.Fatal("parking the reply closed the connection")
+	default:
+	}
+
+	if armResync && !conn.enqueueSnapshot([]byte("snapshot"), 1_000) {
+		t.Fatal("enqueueSnapshot rejected a resync that a reply should have left armed")
+	}
+	writerStarted = true
+	go conn.writeLoop()
+
+	reply, sawSnapshot := readReplyPastQueue(t, client, 1, armResync)
+	if !reply.OK || reply.Error != nil {
+		t.Fatalf("reply = %#v", reply)
+	}
+	if armResync && !sawSnapshot {
+		t.Fatal("resync snapshot was not written after the reply")
+	}
+	select {
+	case <-conn.closed:
+		t.Fatal("delivering the reply closed the connection")
+	default:
+	}
+}
+
+func readReplyPastQueue(t *testing.T, conn net.Conn, requestID uint64, wantSnapshot bool) (protocol.Reply, bool) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var reply protocol.Reply
+	sawReply := false
+	sawSnapshot := false
+	for !sawReply || (wantSnapshot && !sawSnapshot) {
+		frame, err := protocol.ReadFrame(conn)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		switch {
+		case bytes.Equal(frame, []byte{1}):
+			continue
+		case bytes.Equal(frame, []byte("snapshot")):
+			sawSnapshot = true
+		default:
+			var envelope protocol.Envelope
+			if err := protocol.DecodeStrict(frame, &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope.Kind != protocol.KindReply {
+				continue
+			}
+			if envelope.RequestID != requestID {
+				t.Fatalf("reply request ID = %d, want %d", envelope.RequestID, requestID)
+			}
+			decodePayload(t, envelope, &reply)
+			if err := reply.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			sawReply = true
+		}
+	}
+	return reply, sawSnapshot
 }
