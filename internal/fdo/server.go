@@ -244,7 +244,9 @@ func (e endpoint) Notify(sender dbus.Sender, appName string, replacesID uint32, 
 	}
 	var pid uint32
 	if err := e.server.conn.BusObject().Call("org.freedesktop.DBus.GetConnectionUnixProcessID", 0, string(sender)).Store(&pid); err != nil {
-		return 0, busError(dbusFailed, fmt.Errorf("query sender PID: %w", err))
+		// Sender lineage is optional metadata. A fire-and-forget client can be
+		// gone before the lookup runs; the notification must still be created.
+		pid = 0
 	}
 	candidate, err := notify.Normalize(notify.Request{
 		AppName: appName, ReplacesID: replacesID, AppIcon: appIcon, Summary: summary, Body: body,
