@@ -43,6 +43,14 @@ type connection struct {
 	resyncSeq       uint64
 	resyncTail      []outbound
 	resyncTailBytes int
+	// replyHold is one command reply parked because the outbound queue is
+	// already at MaxPresenterQueueMessages or MaxPresenterDecodedBytes. Those
+	// frames are the pre-snapshot backlog: a delta arms resync instead of
+	// failing, and this reply must not fail the connection either. The writer
+	// emits it ahead of that backlog. A second reply waits on replyWait, so
+	// the hold stays a single frame and the queue caps are unchanged.
+	replyHold []byte
+	replyWait sync.Cond
 
 	closed     chan struct{}
 	writerDone chan struct{}
@@ -52,11 +60,13 @@ type connection struct {
 
 func newConnection(socket *net.UnixConn, generation uint64) *connection {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &connection{
+	c := &connection{
 		socket: socket, generation: generation, ctx: ctx, cancel: cancel,
 		queue:  make(chan outbound, protocol.MaxPresenterQueueMessages),
 		closed: make(chan struct{}), writerDone: make(chan struct{}), wake: make(chan struct{}, 1),
 	}
+	c.replyWait.L = &c.mu
+	return c
 }
 
 func (c *connection) prepare(message outbound) bool {
@@ -180,22 +190,40 @@ func (c *connection) enqueueSnapshot(frame []byte, sequence uint64) bool {
 	return true
 }
 
+// enqueue queues a command reply. The delta queue's message and byte caps
+// still apply to anything placed on c.queue. A reply that arrives while those
+// caps are held by pre-snapshot deltas is parked in replyHold instead of
+// failing the connection; the writer emits that one frame before the backlog.
 func (c *connection) enqueue(message outbound) bool {
 	c.mu.Lock()
-	if c.failed || !c.active || !c.reserve(message) {
+	for {
+		if c.failed || !c.active {
+			c.mu.Unlock()
+			c.fail()
+			return false
+		}
+		// Keep reply order: a parked reply has to leave before the next one
+		// is admitted, whether onto the queue or into the hold.
+		if c.replyHold != nil {
+			c.replyWait.Wait()
+			continue
+		}
+		if c.reserve(message) {
+			select {
+			case c.queue <- message:
+				c.mu.Unlock()
+				return true
+			default:
+				c.release(message)
+			}
+		}
+		c.replyHold = message.data
 		c.mu.Unlock()
-		c.fail()
-		return false
-	}
-	select {
-	case c.queue <- message:
-		c.mu.Unlock()
+		select {
+		case c.wake <- struct{}{}:
+		default:
+		}
 		return true
-	default:
-		c.release(message)
-		c.mu.Unlock()
-		c.fail()
-		return false
 	}
 }
 
@@ -229,6 +257,7 @@ func (c *connection) fail() {
 	c.failOnce.Do(func() {
 		c.mu.Lock()
 		c.failed = true
+		c.replyWait.Broadcast()
 		c.mu.Unlock()
 		close(c.closed)
 		if c.socket != nil {
@@ -243,6 +272,16 @@ func (c *connection) fail() {
 func (c *connection) writeLoop() {
 	defer close(c.writerDone)
 	for {
+		// A reply parked against a full pre-snapshot queue is not part of the
+		// delta backlog. Emit it before those frames so the command result is
+		// not stuck behind a resync.
+		if frame, ok := c.takeReply(); ok {
+			if err := protocol.WriteFrame(c.socket, frame); err != nil {
+				c.fail()
+				return
+			}
+			continue
+		}
 		// A scheduled snapshot is written only after every queued delta has
 		// drained, so the baseline never trails a frame already on the wire.
 		if frame, ok := c.takeResync(); ok {
@@ -267,6 +306,19 @@ func (c *connection) writeLoop() {
 			c.mu.Unlock()
 		}
 	}
+}
+
+// takeReply removes the parked command reply, if any. Callers do not hold c.mu.
+func (c *connection) takeReply() ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.replyHold == nil {
+		return nil, false
+	}
+	frame := c.replyHold
+	c.replyHold = nil
+	c.replyWait.Signal()
+	return frame, true
 }
 
 // takeResync consumes a pending snapshot once the queue is empty. It writes the
