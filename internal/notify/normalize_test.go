@@ -1,6 +1,7 @@
 package notify
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -290,4 +291,21 @@ func manyHints(n int) map[string]any {
 		hints[string(rune(i+1))] = i
 	}
 	return hints
+}
+
+func TestNormalizeAcceptsEmptyActionLabel(t *testing.T) {
+	got, err := Normalize(Request{Summary: "ok", Actions: []string{"default", "", "open", "Open"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []protocol.Action{{Key: "default", Label: ""}, {Key: "open", Label: "Open"}}
+	if !reflect.DeepEqual(got.Actions, want) {
+		t.Fatalf("actions = %#v, want %#v", got.Actions, want)
+	}
+}
+
+func TestNormalizeRejectsEmptyActionKey(t *testing.T) {
+	if _, err := Normalize(Request{Summary: "ok", Actions: []string{"", "Open"}}); err == nil {
+		t.Fatal("Normalize() accepted an empty action key")
+	}
 }

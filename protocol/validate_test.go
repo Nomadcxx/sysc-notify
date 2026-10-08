@@ -62,3 +62,15 @@ func TestValidateProducerBounds(t *testing.T) {
 		t.Fatal("publish without producer payload accepted")
 	}
 }
+
+func TestActionValidateAllowsEmptyLabel(t *testing.T) {
+	if err := (Action{Key: "default"}).Validate(); err != nil {
+		t.Fatalf("empty label rejected: %v", err)
+	}
+	if err := (Action{Key: "default", Label: "Open"}).Validate(); err != nil {
+		t.Fatalf("labelled action rejected: %v", err)
+	}
+	if err := (Action{Label: "Open"}).Validate(); err == nil {
+		t.Fatal("empty action key accepted")
+	}
+}

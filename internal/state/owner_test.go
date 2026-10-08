@@ -609,3 +609,15 @@ func TestOwnerHistoryRetentionCountsFromClose(t *testing.T) {
 		t.Fatalf("history timestamp = %v, want close time %v", entry.Timestamp, clock.Now())
 	}
 }
+
+func TestOwnerAcceptsEmptyLabelAction(t *testing.T) {
+	owner, sink := startTestOwner(t)
+	withDefault := candidate("default action", time.Minute)
+	withDefault.Actions = []protocol.Action{{Key: "default", Label: ""}}
+	id := do(t, owner, Command{Kind: Add, Candidate: withDefault}).ID
+	do(t, owner, Command{Kind: InvokeAction, ID: id, ActionKey: "default"})
+	events := sink.Events()
+	if len(events) < 2 || events[1].Action == nil || events[1].Action.Key != "default" {
+		t.Fatalf("events = %#v", events)
+	}
+}

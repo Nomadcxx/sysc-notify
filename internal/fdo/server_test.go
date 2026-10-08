@@ -469,3 +469,27 @@ func TestNotifyWithoutResolvableSenderPIDStillCreatesNotification(t *testing.T) 
 		t.Fatalf("sender lineage = %#v, want empty", snapshot.Active[0].SenderLineage)
 	}
 }
+
+func TestNotifyAcceptsEmptyActionLabel(t *testing.T) {
+	h := startHarness(t, nil)
+	var id uint32
+	err := h.object.Call(Interface+".Notify", 0, "app", uint32(0), "", "default action", "body",
+		[]string{"default", ""}, map[string]dbus.Variant{}, int32(-1)).Store(&id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id == 0 {
+		t.Fatal("Notify returned a zero id")
+	}
+	active, err := h.owner.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active.Active) != 1 {
+		t.Fatalf("active = %#v, want one notification", active.Active)
+	}
+	want := []protocol.Action{{Key: "default", Label: ""}}
+	if !reflect.DeepEqual(active.Active[0].Actions, want) {
+		t.Fatalf("actions = %#v, want %#v", active.Active[0].Actions, want)
+	}
+}
