@@ -162,7 +162,10 @@ func (a Action) Validate() error {
 	if err := validateText("action key", a.Key, MaxBodyBytes, false); err != nil {
 		return err
 	}
-	return validateText("action label", a.Label, MaxBodyBytes, false)
+	// The spec leaves the label optional and only requires the key to be named,
+	// and GLib's freedesktop backend always sends the default action as
+	// ("default", ""), so an empty label must not reject the whole request.
+	return validateText("action label", a.Label, MaxBodyBytes, true)
 }
 
 func (p ProducerRequest) Validate() error {

@@ -102,8 +102,8 @@ func TestMalformedNotifyAndMissingClosePreserveState(t *testing.T) {
 	h := startHarness(t, nil)
 	id := sendNotify(t, h.object, 0, "valid", nil, 0)
 	call := h.object.Call(Interface+".Notify", 0,
-		"app", uint32(0), "", "invalid", "", []string{},
-		map[string]dbus.Variant{"urgency": dbus.MakeVariant("critical")}, int32(0),
+		"app", uint32(0), "", "invalid", "", []string{"lonely key"},
+		map[string]dbus.Variant{}, int32(0),
 	)
 	assertDBusError(t, call.Err, dbusInvalidArgs)
 	assertDBusError(t, h.object.Call(Interface+".CloseNotification", 0, uint32(999)).Err, invalidNotification)
@@ -462,6 +462,31 @@ func TestPipelinedUpdatesEndOnTheLastOne(t *testing.T) {
 	}
 }
 
+func TestNotifyIgnoresBadOptionalHints(t *testing.T) {
+	requireSessionBus(t)
+	h := startHarness(t, nil)
+	hints := map[string]dbus.Variant{
+		notify.HintValue:     dbus.MakeVariant(byte(50)),
+		notify.HintUrgency:   dbus.MakeVariant(int32(9)),
+		notify.HintTransient: dbus.MakeVariant("yes"),
+	}
+	id := sendNotify(t, h.object, 0, "lenient", hints, 0)
+	if id == 0 {
+		t.Fatal("bad optional hints rejected the notification")
+	}
+	snap, err := h.owner.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := snap.Active
+	if len(active) != 1 || active[0].Summary != "lenient" {
+		t.Fatalf("bad optional hints changed the notification: %#v", active)
+	}
+	if active[0].Value != nil || active[0].Urgency != protocol.UrgencyNormal {
+		t.Fatalf("bad optional hints were kept: %#v", active[0])
+	}
+}
+
 func assertDBusError(t *testing.T, err error, name string) {
 	t.Helper()
 	if err == nil {
@@ -537,5 +562,29 @@ func TestNotifyWithoutResolvableSenderPIDStillCreatesNotification(t *testing.T) 
 	}
 	if len(snapshot.Active[0].SenderLineage) != 0 {
 		t.Fatalf("sender lineage = %#v, want empty", snapshot.Active[0].SenderLineage)
+	}
+}
+
+func TestNotifyAcceptsEmptyActionLabel(t *testing.T) {
+	h := startHarness(t, nil)
+	var id uint32
+	err := h.object.Call(Interface+".Notify", 0, "app", uint32(0), "", "default action", "body",
+		[]string{"default", ""}, map[string]dbus.Variant{}, int32(-1)).Store(&id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id == 0 {
+		t.Fatal("Notify returned a zero id")
+	}
+	active, err := h.owner.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active.Active) != 1 {
+		t.Fatalf("active = %#v, want one notification", active.Active)
+	}
+	want := []protocol.Action{{Key: "default", Label: ""}}
+	if !reflect.DeepEqual(active.Active[0].Actions, want) {
+		t.Fatalf("actions = %#v, want %#v", active.Active[0].Actions, want)
 	}
 }

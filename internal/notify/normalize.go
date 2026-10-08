@@ -54,65 +54,38 @@ func Normalize(request Request) (Candidate, error) {
 	}
 
 	for key, value := range request.Hints {
+		// Optional hints are decorations, not the notification: a wrong type or
+		// an out-of-range value drops that one hint and leaves the default, the
+		// same soft path a malformed image hint takes. Structural problems
+		// (hints count, core text, action list, expiry) still fail the call.
 		switch key {
 		case HintUrgency:
-			urgency, ok := value.(uint8)
-			if !ok || urgency > uint8(protocol.UrgencyCritical) {
-				return Candidate{}, errors.New("notify: invalid urgency hint")
+			if urgency, ok := value.(uint8); ok && urgency <= uint8(protocol.UrgencyCritical) {
+				candidate.Urgency = protocol.Urgency(urgency)
 			}
-			candidate.Urgency = protocol.Urgency(urgency)
 		case HintTransient:
-			var ok bool
-			candidate.Transient, ok = value.(bool)
-			if !ok {
-				return Candidate{}, errors.New("notify: invalid transient hint")
-			}
+			candidate.Transient, _ = value.(bool)
 		case HintPrivate:
-			var ok bool
-			candidate.Private, ok = value.(bool)
-			if !ok {
-				return Candidate{}, errors.New("notify: invalid private hint")
-			}
+			candidate.Private, _ = value.(bool)
 		case HintResident:
-			var ok bool
-			candidate.Resident, ok = value.(bool)
-			if !ok {
-				return Candidate{}, errors.New("notify: invalid resident hint")
-			}
+			candidate.Resident, _ = value.(bool)
 		case HintDesktopEntry:
-			var ok bool
-			candidate.DesktopEntry, ok = value.(string)
-			if !ok {
-				return Candidate{}, errors.New("notify: invalid desktop-entry hint")
-			}
-			if err := validateString("desktop entry", candidate.DesktopEntry, true); err != nil {
-				return Candidate{}, err
+			if entry, ok := value.(string); ok && validateString("desktop entry", entry, true) == nil {
+				candidate.DesktopEntry = entry
 			}
 		case HintCategory:
-			var ok bool
-			candidate.Category, ok = value.(string)
-			if !ok {
-				return Candidate{}, errors.New("notify: invalid category hint")
-			}
-			if err := validateString("category", candidate.Category, true); err != nil {
-				return Candidate{}, err
+			if category, ok := value.(string); ok && validateString("category", category, true) == nil {
+				candidate.Category = category
 			}
 		case HintValue:
-			v, ok := value.(int32)
-			if !ok || v < 0 || v > 100 {
-				return Candidate{}, errors.New("notify: invalid value hint")
+			if v, ok := value.(int32); ok && v >= 0 && v <= 100 {
+				candidate.Value = &v
 			}
-			candidate.Value = &v
 		case HintInlineReplyPlaceholder:
-			placeholder, ok := value.(string)
-			if !ok {
-				return Candidate{}, errors.New("notify: invalid inline-reply hint")
+			if placeholder, ok := value.(string); ok && validateString("reply placeholder", placeholder, true) == nil {
+				candidate.InlineReply = true
+				candidate.ReplyPlaceholder = placeholder
 			}
-			if err := validateString("reply placeholder", placeholder, true); err != nil {
-				return Candidate{}, err
-			}
-			candidate.InlineReply = true
-			candidate.ReplyPlaceholder = placeholder
 		}
 	}
 	applyImageHints(&candidate, request.Hints)

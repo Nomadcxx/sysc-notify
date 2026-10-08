@@ -92,6 +92,9 @@ type Notification struct {
 	SenderLineage    []Process `json:"sender_lineage,omitempty"`
 }
 
+// Action is one key/label pair from the Notify action list. An empty Label is
+// valid: the key "default" is the body-click action rather than a button, so
+// presenters may render it without any text.
 type Action struct {
 	Key   string `json:"key"`
 	Label string `json:"label"`
