@@ -2,6 +2,7 @@ package history
 
 import (
 	"bytes"
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
@@ -169,5 +170,28 @@ func TestInvalidHistoryLogsQuarantine(t *testing.T) {
 	line := logged.String()
 	if !strings.Contains(line, "empty history") || !strings.Contains(line, filepath.Base(matches[0])) {
 		t.Fatalf("quarantine was not logged with its file name: %q", line)
+	}
+}
+
+func TestQuarantineReportsNameWhenDirectorySyncFails(t *testing.T) {
+	dir := t.TempDir()
+	contents := []byte("not-json")
+	if err := os.WriteFile(filepath.Join(dir, historyFilename), contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	syncErr := errors.New("forced sync failure")
+	name, err := quarantine(dir, time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC), func(string) error {
+		return syncErr
+	})
+	if !errors.Is(err, syncErr) {
+		t.Fatalf("quarantine error = %v, want wrapped sync failure", err)
+	}
+	if name == "" || !strings.Contains(err.Error(), name) {
+		t.Fatalf("quarantine error %q does not identify moved file %q", err, name)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil || !bytes.Equal(got, contents) {
+		t.Fatalf("quarantine contents = %q, %v", got, err)
 	}
 }

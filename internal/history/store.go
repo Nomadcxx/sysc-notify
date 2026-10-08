@@ -115,7 +115,7 @@ func OpenAt(stateHome string, now time.Time) (*Store, error) {
 		}
 	}
 	if err != nil {
-		name, quarantineErr := quarantine(dir, now)
+		name, quarantineErr := quarantine(dir, now, syncDirectory)
 		if quarantineErr != nil {
 			return nil, errors.Join(fmt.Errorf("history: invalid committed file: %w", err), quarantineErr)
 		}
@@ -539,7 +539,7 @@ func splitPath(path string) []string {
 
 // quarantine moves an unusable history.json aside and returns its new name so
 // the caller can tell the user where the entries went.
-func quarantine(dir string, now time.Time) (string, error) {
+func quarantine(dir string, now time.Time, syncDir func(string) error) (string, error) {
 	random := make([]byte, 6)
 	if _, err := rand.Read(random); err != nil {
 		return "", fmt.Errorf("history: generate quarantine name: %w", err)
@@ -548,7 +548,10 @@ func quarantine(dir string, now time.Time) (string, error) {
 	if err := os.Rename(filepath.Join(dir, historyFilename), filepath.Join(dir, name)); err != nil {
 		return "", fmt.Errorf("history: quarantine invalid file: %w", err)
 	}
-	return name, syncDirectory(dir)
+	if err := syncDir(dir); err != nil {
+		return name, fmt.Errorf("history: quarantine moved file to %s: %w", name, err)
+	}
+	return name, nil
 }
 
 func requireEOF(decoder *json.Decoder) error {
