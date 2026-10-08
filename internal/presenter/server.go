@@ -43,6 +43,11 @@ type Server struct {
 	started    bool
 	closing    bool
 
+	// conns holds every live handle, not just current/preparing. A connection
+	// that is still in its handshake is in neither field, so Close would
+	// otherwise wait for a peer that nothing ever closes.
+	conns map[*connection]struct{}
+
 	stop      chan struct{}
 	done      chan error
 	closeOnce sync.Once
@@ -54,7 +59,7 @@ type Server struct {
 
 func NewAt(runtimeDir string) *Server {
 	uid := uint32(os.Geteuid())
-	s := &Server{runtimeDir: runtimeDir, uid: uid, stop: make(chan struct{}), done: make(chan error, 1)}
+	s := &Server{runtimeDir: runtimeDir, uid: uid, stop: make(chan struct{}), done: make(chan error, 1), conns: make(map[*connection]struct{})}
 	s.peerUID.Store(uid)
 	return s
 }
@@ -103,17 +108,20 @@ func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.stop)
 		s.mu.Lock()
-		listener, current, preparing, path := s.listener, s.current, s.preparing, s.socketPath
+		listener, path := s.listener, s.socketPath
 		s.closing = true
+		conns := make([]*connection, 0, len(s.conns))
+		for c := range s.conns {
+			conns = append(conns, c)
+		}
 		s.mu.Unlock()
 		if listener != nil {
 			result = errors.Join(result, listener.Close())
 		}
-		if current != nil {
-			current.fail()
-		}
-		if preparing != nil && preparing != current {
-			preparing.fail()
+		// Failing the socket unblocks readHello, the handshake writes, readLoop
+		// and writeLoop. fail is idempotent through failOnce.
+		for _, c := range conns {
+			c.fail()
 		}
 		s.wg.Wait()
 		if path != "" {
@@ -267,6 +275,14 @@ func (s *Server) acceptConn() (*net.UnixConn, error) {
 func (s *Server) handle(socket *net.UnixConn) {
 	defer s.wg.Done()
 	c := newConnection(socket, 0)
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		_ = socket.Close()
+		return
+	}
+	s.conns[c] = struct{}{}
+	s.mu.Unlock()
 	writerStarted := false
 	defer func() {
 		c.fail()
@@ -293,7 +309,7 @@ func (s *Server) handle(socket *net.UnixConn) {
 	c.producer = hasCapability(hello.Capabilities, protocol.CapabilityBatteryProducer)
 
 	s.mu.Lock()
-	if s.preparing != nil {
+	if s.closing || s.preparing != nil {
 		s.mu.Unlock()
 		return
 	}
@@ -327,7 +343,7 @@ func (s *Server) handle(socket *net.UnixConn) {
 	// connection, so the next dial was closed as a concurrent handshake
 	// (sysc-1014: "read frame length: EOF" flakes on CI back-to-back connects).
 	s.mu.Lock()
-	if s.preparing != c || !c.activate(snapshot.Sequence) {
+	if s.closing || s.preparing != c || !c.activate(snapshot.Sequence) {
 		if s.preparing == c {
 			s.preparing = nil
 		}
@@ -370,6 +386,7 @@ func (s *Server) handle(socket *net.UnixConn) {
 
 func (s *Server) connectionDone(c *connection) {
 	s.mu.Lock()
+	delete(s.conns, c)
 	wasCurrent := s.current == c
 	if wasCurrent {
 		s.current = nil
