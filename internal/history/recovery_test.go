@@ -2,8 +2,11 @@ package history
 
 import (
 	"bytes"
+	"errors"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -133,5 +136,62 @@ func TestOversizedHistoryIsQuarantined(t *testing.T) {
 	}
 	if _, err := os.Stat(historyPath); !os.IsNotExist(err) {
 		t.Fatalf("oversized history path remains: %v", err)
+	}
+}
+
+// Quarantining history.json is destructive from the user's point of view: the
+// file is renamed and the notification centre comes back empty. The daemon must
+// say so, including where the old entries went.
+func TestInvalidHistoryLogsQuarantine(t *testing.T) {
+	stateHome := t.TempDir()
+	dir := filepath.Join(stateHome, "sysc-notify")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, historyFilename), []byte(`not-json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logged bytes.Buffer
+	restore := log.Writer()
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(restore) })
+
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	store, err := OpenAt(stateHome, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	matches, err := filepath.Glob(filepath.Join(dir, "history.quarantine-*.json"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("quarantine matches = %v, %v", matches, err)
+	}
+	line := logged.String()
+	if !strings.Contains(line, "empty history") || !strings.Contains(line, filepath.Base(matches[0])) {
+		t.Fatalf("quarantine was not logged with its file name: %q", line)
+	}
+}
+
+func TestQuarantineReportsNameWhenDirectorySyncFails(t *testing.T) {
+	dir := t.TempDir()
+	contents := []byte("not-json")
+	if err := os.WriteFile(filepath.Join(dir, historyFilename), contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	syncErr := errors.New("forced sync failure")
+	name, err := quarantine(dir, time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC), func(string) error {
+		return syncErr
+	})
+	if !errors.Is(err, syncErr) {
+		t.Fatalf("quarantine error = %v, want wrapped sync failure", err)
+	}
+	if name == "" || !strings.Contains(err.Error(), name) {
+		t.Fatalf("quarantine error %q does not identify moved file %q", err, name)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil || !bytes.Equal(got, contents) {
+		t.Fatalf("quarantine contents = %q, %v", got, err)
 	}
 }
