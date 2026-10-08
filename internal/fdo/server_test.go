@@ -495,6 +495,33 @@ func TestNotifyWithoutResolvableSenderPIDStillCreatesNotification(t *testing.T) 
 	}
 }
 
+func TestNotifyAcceptsLibnotifyImageLayout(t *testing.T) {
+	h := startHarness(t, nil)
+	// 3x3 RGB with a 4-byte-aligned stride of 12; libnotify sends
+	// (3-1)*12 + 3*3 = 33 bytes rather than the fully padded 36.
+	data := make([]byte, 2*12+3*3)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	var id uint32
+	err := h.object.Call(Interface+".Notify", 0, "app", uint32(0), "", "libnotify layout", "body",
+		[]string{}, map[string]dbus.Variant{
+			notify.HintImageData: dbus.MakeVariant(imageData{
+				Width: 3, Height: 3, RowStride: 12, BitsPerSample: 8, Channels: 3, Data: data,
+			}),
+		}, int32(0)).Store(&id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := h.owner.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active.Active) != 1 || active.Active[0].Image == nil {
+		t.Fatalf("active = %#v, want one notification carrying an image", active.Active)
+	}
+}
+
 func TestNotifyAcceptsEmptyActionLabel(t *testing.T) {
 	h := startHarness(t, nil)
 	var id uint32
