@@ -50,6 +50,11 @@ type Server struct {
 	attempted bool
 	served    bool
 
+	// order serializes one sender's Notify and CloseNotification against each
+	// other. nil means no ordering, which keeps embedders that do not install
+	// an incoming interceptor working exactly as before.
+	order *CallOrder
+
 	signals     chan *dbus.Signal
 	stop        chan struct{}
 	done        chan error
@@ -67,8 +72,15 @@ func New(conn *dbus.Conn) *Server {
 }
 
 func NewAt(conn *dbus.Conn, procRoot string) *Server {
+	return NewAtWithOrder(conn, procRoot, nil)
+}
+
+// NewAtWithOrder binds the server to an arrival-order ticketer. The same value
+// must be installed as the connection's incoming interceptor, otherwise no
+// message carries a ticket and ordering is a no-op.
+func NewAtWithOrder(conn *dbus.Conn, procRoot string, order *CallOrder) *Server {
 	return &Server{
-		conn: conn, procRoot: procRoot, signals: make(chan *dbus.Signal, 8), stop: make(chan struct{}),
+		conn: conn, procRoot: procRoot, order: order, signals: make(chan *dbus.Signal, 8), stop: make(chan struct{}),
 		emitter: conn, emitQueue: make(chan queuedSignal, emitQueueSize),
 		done: make(chan error, 1), monitorDone: make(chan struct{}),
 	}
@@ -147,6 +159,9 @@ func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
 		s.closing.Store(true)
 		close(s.stop)
+		// Release any handler still waiting for its turn before the object goes
+		// away, so shutdown cannot wedge behind it.
+		s.order.Close()
 		s.mu.RLock()
 		served := s.served
 		s.mu.RUnlock()
@@ -235,11 +250,15 @@ func (e endpoint) GetServerInformation() (string, string, string, string, *dbus.
 	return ServerName, ServerVendor, ServerVersion, SpecVersion, nil
 }
 
-func (e endpoint) Notify(sender dbus.Sender, appName string, replacesID uint32, appIcon, summary, body string,
+func (e endpoint) Notify(msg dbus.Message, sender dbus.Sender, appName string, replacesID uint32, appIcon, summary, body string,
 	actions []string, variants map[string]dbus.Variant, expireTimeout int32,
 ) (uint32, *dbus.Error) {
 	hints, err := convertHints(variants)
 	if err != nil {
+		// This call already holds a ticket. Take the turn and hand it straight
+		// back, or every later call from this sender waits behind a call that
+		// never reaches state.
+		e.server.order.Enter(msg)()
 		return 0, busError(dbusInvalidArgs, err)
 	}
 	var pid uint32
@@ -254,8 +273,14 @@ func (e endpoint) Notify(sender dbus.Sender, appName string, replacesID uint32, 
 		Sender: notify.Sender{Name: string(sender), PID: pid, Lineage: sendermeta.Capture(e.server.procRoot, pid)},
 	})
 	if err != nil {
+		e.server.order.Enter(msg)()
 		return 0, busError(dbusInvalidArgs, err)
 	}
+	// The slow preprocessing above stays outside the ordered section; from here
+	// on this sender's later calls wait, so the update reaches state before a
+	// CloseNotification the client pipelined behind it.
+	release := e.server.order.Enter(msg)
+	defer release()
 	owner := e.server.stateOwner()
 	if owner == nil {
 		return 0, busError(dbusFailed, errors.New("notification state unavailable"))
@@ -267,7 +292,9 @@ func (e endpoint) Notify(sender dbus.Sender, appName string, replacesID uint32, 
 	return result.ID, nil
 }
 
-func (e endpoint) CloseNotification(id uint32) *dbus.Error {
+func (e endpoint) CloseNotification(msg dbus.Message, id uint32) *dbus.Error {
+	release := e.server.order.Enter(msg)
+	defer release()
 	owner := e.server.stateOwner()
 	if owner == nil {
 		return busError(dbusFailed, errors.New("notification state unavailable"))
