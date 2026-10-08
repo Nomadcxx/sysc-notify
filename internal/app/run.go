@@ -54,11 +54,15 @@ func Run(ctx context.Context, config Config) error {
 		return errors.Join(err, shutdown(owner, presentation, nil, nil, store))
 	}
 
-	conn, err := dbus.ConnectSessionBus()
+	// The interceptor stamps each Notify/CloseNotification with its bus arrival
+	// order so godbus's one-goroutine-per-call dispatch cannot apply them out of
+	// order and orphan a notification.
+	order := fdo.NewCallOrder()
+	conn, err := dbus.ConnectSessionBus(dbus.WithIncomingInterceptor(order.Observe))
 	if err != nil {
 		return errors.Join(err, shutdown(owner, presentation, nil, nil, store))
 	}
-	service := fdo.NewAt(conn, config.ProcRoot)
+	service := fdo.NewAtWithOrder(conn, config.ProcRoot, order)
 	sink.add(service)
 	if err := service.Serve(owner); err != nil {
 		return errors.Join(err, shutdown(owner, presentation, service, conn, store))

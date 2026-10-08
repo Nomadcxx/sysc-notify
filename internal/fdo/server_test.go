@@ -335,13 +335,25 @@ func startHarness(t *testing.T, clock state.Clock) harness {
 }
 
 func startHarnessAt(t *testing.T, clock state.Clock, procRoot string) harness {
+	return startOrderedHarness(t, clock, procRoot, false)
+}
+
+// startOrderedHarness wires the same private bus with the arrival-order
+// interceptor installed, the way app.Run does.
+func startOrderedHarness(t *testing.T, clock state.Clock, procRoot string, ordered bool) harness {
 	t.Helper()
 	requireSessionBus(t)
-	serverConn, err := dbus.Connect(dbustest.Session(t))
+	var order *CallOrder
+	var serverOpts []dbus.ConnOption
+	if ordered {
+		order = NewCallOrder()
+		serverOpts = append(serverOpts, dbus.WithIncomingInterceptor(order.Observe))
+	}
+	serverConn, err := dbus.Connect(dbustest.Session(t), serverOpts...)
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewAt(serverConn, procRoot)
+	server := NewAtWithOrder(serverConn, procRoot, order)
 	owner := state.Start(clock, server)
 	if err := server.Serve(owner); err != nil {
 		_ = owner.Close()
@@ -390,6 +402,64 @@ func sendNotify(t *testing.T, object dbus.BusObject, replacesID uint32, summary 
 		t.Fatal(err)
 	}
 	return id
+}
+
+// TestPipelinedNotifyThenCloseLeavesNothingActive pipelines an update and the
+// close that follows it, without waiting for the update's reply. godbus runs
+// each call on its own goroutine, so the close used to win the race, the update
+// missed its replaces_id and the notification was orphaned.
+func TestPipelinedNotifyThenCloseLeavesNothingActive(t *testing.T) {
+	h := startOrderedHarness(t, nil, t.TempDir(), true)
+	for i := 0; i < 50; i++ {
+		id := sendNotify(t, h.object, 0, "open", nil, 0)
+		update := h.object.Go(Interface+".Notify", 0, nil,
+			"app", uint32(id), "", "done", "", []string{}, map[string]dbus.Variant{}, int32(0))
+		closed := h.object.Go(Interface+".CloseNotification", 0, nil, id)
+		<-update.Done
+		<-closed.Done
+		var returned uint32
+		if err := update.Store(&returned); err != nil {
+			t.Fatalf("iteration %d: update failed: %v", i, err)
+		}
+		if returned != id {
+			t.Fatalf("iteration %d: update returned %d, want the original %d", i, returned, id)
+		}
+	}
+	snapshot, err := h.owner.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Active) != 0 {
+		t.Fatalf("pipelined update-then-close left %d active notifications: %#v",
+			len(snapshot.Active), snapshot.Active)
+	}
+}
+
+func TestPipelinedUpdatesEndOnTheLastOne(t *testing.T) {
+	h := startOrderedHarness(t, nil, t.TempDir(), true)
+	for i := 0; i < 20; i++ {
+		id := sendNotify(t, h.object, 0, "progress 0", nil, 0)
+		calls := make([]*dbus.Call, 0, 10)
+		for n := 1; n <= 10; n++ {
+			calls = append(calls, h.object.Go(Interface+".Notify", 0, nil,
+				"app", uint32(id), "", fmt.Sprintf("progress %d", n), "", []string{}, map[string]dbus.Variant{}, int32(0)))
+		}
+		for _, call := range calls {
+			<-call.Done
+			if call.Err != nil {
+				t.Fatalf("iteration %d: pipelined update failed: %v", i, call.Err)
+			}
+		}
+		snapshot, err := h.owner.Snapshot(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(snapshot.Active) != 1 || snapshot.Active[0].Summary != "progress 10" {
+			t.Fatalf("iteration %d: pipelined updates ended on %#v, want progress 10",
+				i, snapshot.Active)
+		}
+		h.object.Call(Interface+".CloseNotification", 0, uint32(id))
+	}
 }
 
 func TestNotifyIgnoresBadOptionalHints(t *testing.T) {
@@ -476,7 +546,7 @@ func (f emitFunc) Emit(path dbus.ObjectPath, name string, values ...any) error {
 func TestNotifyWithoutResolvableSenderPIDStillCreatesNotification(t *testing.T) {
 	h := startHarness(t, nil)
 	e := endpoint{server: h.server}
-	id, busErr := e.Notify(dbus.Sender(":1.999999"), "app", 0, "", "fire", "body", nil, nil, 0)
+	id, busErr := e.Notify(dbus.Message{}, dbus.Sender(":1.999999"), "app", 0, "", "fire", "body", nil, nil, 0)
 	if busErr != nil {
 		t.Fatalf("Notify with unresolvable sender failed: %v", busErr)
 	}
