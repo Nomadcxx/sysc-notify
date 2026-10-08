@@ -30,8 +30,14 @@ func (r RawImage) Validate() error {
 		return errors.New("notify: invalid image row stride")
 	}
 	rawBytes := int64(r.RowStride) * int64(r.Height)
+	// The last row needs no padding: libnotify sends
+	// (height-1)*rowstride + width*channels, while GdkPixbuf-style senders may
+	// pad it out to rowstride*height.
+	minimumBytes := int64(r.RowStride)*int64(r.Height-1) + minimumStride
 	decodedBytes := int64(r.Width) * int64(r.Height) * 4
-	if rawBytes > protocol.MaxSourceImageBytes || decodedBytes > protocol.MaxSourceImageBytes || rawBytes != int64(len(r.Data)) {
+	dataBytes := int64(len(r.Data))
+	if rawBytes > protocol.MaxSourceImageBytes || decodedBytes > protocol.MaxSourceImageBytes ||
+		dataBytes < minimumBytes || dataBytes > rawBytes {
 		return errors.New("notify: invalid image data length")
 	}
 	return nil
@@ -53,6 +59,8 @@ func normalizeImage(raw RawImage) (*protocol.Image, error) {
 		for x := 0; x < dstWidth; x++ {
 			sourceX := x * width / dstWidth
 			source := sourceY*int(raw.RowStride) + sourceX*int(raw.Channels)
+			// The highest index read is (height-1)*rowstride + width*channels - 1,
+			// which is within the minimum length Validate accepts, padding or not.
 			target := y*dst.Stride + x*4
 			dst.Pix[target], dst.Pix[target+1], dst.Pix[target+2] = raw.Data[source], raw.Data[source+1], raw.Data[source+2]
 			dst.Pix[target+3] = 0xff
