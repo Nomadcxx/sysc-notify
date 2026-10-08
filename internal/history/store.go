@@ -115,9 +115,14 @@ func OpenAt(stateHome string, now time.Time) (*Store, error) {
 		}
 	}
 	if err != nil {
-		if quarantineErr := quarantine(dir, now); quarantineErr != nil {
+		name, quarantineErr := quarantine(dir, now)
+		if quarantineErr != nil {
 			return nil, errors.Join(fmt.Errorf("history: invalid committed file: %w", err), quarantineErr)
 		}
+		// The committed file is gone and the notification centre starts empty,
+		// so say so. Without this the history just looks like it was never
+		// recorded and nothing points at the file that still has the entries.
+		log.Printf("sysc-notify: history: committed file was unusable (%v), moved to %s, starting with empty history", err, name)
 		go store.persistLoop()
 		return store, nil
 	}
@@ -532,16 +537,18 @@ func splitPath(path string) []string {
 	return parts
 }
 
-func quarantine(dir string, now time.Time) error {
+// quarantine moves an unusable history.json aside and returns its new name so
+// the caller can tell the user where the entries went.
+func quarantine(dir string, now time.Time) (string, error) {
 	random := make([]byte, 6)
 	if _, err := rand.Read(random); err != nil {
-		return fmt.Errorf("history: generate quarantine name: %w", err)
+		return "", fmt.Errorf("history: generate quarantine name: %w", err)
 	}
 	name := fmt.Sprintf("history.quarantine-%s-%s.json", now.UTC().Format("20060102T150405.000000000Z"), hex.EncodeToString(random))
 	if err := os.Rename(filepath.Join(dir, historyFilename), filepath.Join(dir, name)); err != nil {
-		return fmt.Errorf("history: quarantine invalid file: %w", err)
+		return "", fmt.Errorf("history: quarantine invalid file: %w", err)
 	}
-	return syncDirectory(dir)
+	return name, syncDirectory(dir)
 }
 
 func requireEOF(decoder *json.Decoder) error {
