@@ -251,8 +251,6 @@ func TestNormalizeRejectsStructuralBounds(t *testing.T) {
 		"large body":    {Summary: "ok", Body: strings.Repeat("x", protocol.MaxBodyBytes+1)},
 		"many hints":    {Summary: "ok", Hints: manyHints(protocol.MaxHints + 1)},
 		"bad timeout":   {Summary: "ok", ExpireTimeout: -2},
-		"bad urgency":   {Summary: "ok", Hints: map[string]any{HintUrgency: uint8(9)}},
-		"bad value":     {Summary: "ok", Hints: map[string]any{HintValue: int32(101)}},
 	}
 	for name, request := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -273,6 +271,70 @@ func TestNormalizeDoesNotMutateRequestOrExistingStateOnError(t *testing.T) {
 	}
 	if existing[7] != "old" || len(request.Actions) != 1 || request.Hints["unknown"] != "kept" {
 		t.Fatal("Normalize() mutated caller-owned state")
+	}
+}
+
+func TestNormalizeDropsBadOptionalHints(t *testing.T) {
+	tests := map[string]struct {
+		hint any
+		key  string
+	}{
+		"urgency out of range": {key: HintUrgency, hint: uint8(9)},
+		"urgency wrong type":   {key: HintUrgency, hint: int32(1)},
+		"transient wrong type": {key: HintTransient, hint: "yes"},
+		"private wrong type":   {key: HintPrivate, hint: int32(1)},
+		"resident wrong type":  {key: HintResident, hint: uint8(1)},
+		"desktop wrong type":   {key: HintDesktopEntry, hint: 7},
+		"category wrong type":  {key: HintCategory, hint: true},
+		"value out of range":   {key: HintValue, hint: int32(101)},
+		"value negative":       {key: HintValue, hint: int32(-1)},
+		"value wrong type":     {key: HintValue, hint: byte(50)},
+		"placeholder wrong":    {key: HintInlineReplyPlaceholder, hint: 3},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			request := Request{Summary: "ok", Hints: map[string]any{test.key: test.hint}}
+			got, err := Normalize(request)
+			if err != nil {
+				t.Fatalf("Normalize() rejected a bad optional hint: %v", err)
+			}
+			if got.Summary != "ok" {
+				t.Fatalf("bad hint lost the summary: %#v", got)
+			}
+			if got.Value != nil {
+				t.Fatalf("bad value hint was kept: %v", *got.Value)
+			}
+			if got.Urgency != protocol.UrgencyNormal {
+				t.Fatalf("bad urgency hint was kept: %v", got.Urgency)
+			}
+			if got.Transient || got.Private || got.Resident {
+				t.Fatalf("bad bool hint was kept: %#v", got)
+			}
+			if got.DesktopEntry != "" || got.Category != "" {
+				t.Fatalf("bad string hint was kept: %#v", got)
+			}
+			if got.InlineReply || got.ReplyPlaceholder != "" {
+				t.Fatalf("bad inline-reply hint armed inline reply: %#v", got)
+			}
+		})
+	}
+}
+
+func TestNormalizeKeepsGoodOptionalHints(t *testing.T) {
+	got, err := Normalize(Request{Summary: "ok", Hints: map[string]any{
+		HintUrgency:                uint8(protocol.UrgencyCritical),
+		HintValue:                  int32(100),
+		HintTransient:              true,
+		HintCategory:               "im.received",
+		HintInlineReplyPlaceholder: "answer",
+	}})
+	if err != nil {
+		t.Fatalf("Normalize() rejected valid hints: %v", err)
+	}
+	if got.Urgency != protocol.UrgencyCritical || got.Value == nil || *got.Value != 100 ||
+		!got.Transient || got.Category != "im.received" || !got.InlineReply ||
+		got.ReplyPlaceholder != "answer" {
+		t.Fatalf("Normalize() dropped valid hints: %#v", got)
 	}
 }
 

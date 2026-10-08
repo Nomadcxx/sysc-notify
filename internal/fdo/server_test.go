@@ -102,8 +102,8 @@ func TestMalformedNotifyAndMissingClosePreserveState(t *testing.T) {
 	h := startHarness(t, nil)
 	id := sendNotify(t, h.object, 0, "valid", nil, 0)
 	call := h.object.Call(Interface+".Notify", 0,
-		"app", uint32(0), "", "invalid", "", []string{},
-		map[string]dbus.Variant{"urgency": dbus.MakeVariant("critical")}, int32(0),
+		"app", uint32(0), "", "invalid", "", []string{"lonely key"},
+		map[string]dbus.Variant{}, int32(0),
 	)
 	assertDBusError(t, call.Err, dbusInvalidArgs)
 	assertDBusError(t, h.object.Call(Interface+".CloseNotification", 0, uint32(999)).Err, invalidNotification)
@@ -390,6 +390,31 @@ func sendNotify(t *testing.T, object dbus.BusObject, replacesID uint32, summary 
 		t.Fatal(err)
 	}
 	return id
+}
+
+func TestNotifyIgnoresBadOptionalHints(t *testing.T) {
+	requireSessionBus(t)
+	h := startHarness(t, nil)
+	hints := map[string]dbus.Variant{
+		notify.HintValue:     dbus.MakeVariant(byte(50)),
+		notify.HintUrgency:   dbus.MakeVariant(int32(9)),
+		notify.HintTransient: dbus.MakeVariant("yes"),
+	}
+	id := sendNotify(t, h.object, 0, "lenient", hints, 0)
+	if id == 0 {
+		t.Fatal("bad optional hints rejected the notification")
+	}
+	snap, err := h.owner.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := snap.Active
+	if len(active) != 1 || active[0].Summary != "lenient" {
+		t.Fatalf("bad optional hints changed the notification: %#v", active)
+	}
+	if active[0].Value != nil || active[0].Urgency != protocol.UrgencyNormal {
+		t.Fatalf("bad optional hints were kept: %#v", active[0])
+	}
 }
 
 func assertDBusError(t *testing.T, err error, name string) {
