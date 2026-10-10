@@ -23,7 +23,26 @@ session bus and streams notification state to the shell over a Unix socket.
 
 ### Requirements
 
-Go 1.26+ and a D-Bus session bus.
+A D-Bus session bus. Source builds need Go 1.26+.
+
+### Guided installer (recommended)
+
+Use the [SYSC Go installer](https://github.com/Nomadcxx/sysc#install) to set up
+the shell, its companions and your Niri session together.
+
+### AUR
+
+On Arch, install [sysc-notify](https://aur.archlinux.org/packages/sysc-notify) with
+your AUR helper. Stop your other notification daemon before enabling this service:
+
+```sh
+yay -S sysc-notify
+systemctl --user enable --now sysc-notify.service
+```
+
+The AUR package includes the user unit; source builds use the installation steps below.
+
+[Documentation](https://nomadcxx.github.io/sysc/docs/).
 
 ### From source
 
@@ -41,7 +60,7 @@ GOBIN="$HOME/.local/bin" go install github.com/Nomadcxx/sysc-notify/cmd/sysc-not
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-### As a user service
+### Source builds: user service
 
 ```bash
 install -Dm644 contrib/sysc-notify.service ~/.config/systemd/user/sysc-notify.service
