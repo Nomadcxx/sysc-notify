@@ -1,8 +1,12 @@
 package state
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"image"
+	"image/color"
+	"image/png"
 	"os"
 	"path/filepath"
 	"slices"
@@ -134,6 +138,56 @@ func TestOwnerPersistsOnlyEligibleClosedHistory(t *testing.T) {
 	entry := got.History[0]
 	if entry.ID != ordinaryID || entry.AppName != "Browser" || entry.Summary != "ordinary" {
 		t.Fatalf("history entry = %#v", entry)
+	}
+}
+
+func TestOwnerKeepsPreparedHistoryImageSeparateFromDisplayImage(t *testing.T) {
+	clock := newManualClock()
+	stateHome := t.TempDir()
+	store, err := history.OpenAt(stateHome, clock.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := StartWithHistory(clock, newEventSink(), store)
+	t.Cleanup(func() { _ = owner.Close() })
+
+	picture := image.NewNRGBA(image.Rect(0, 0, 120, 1))
+	for x := range 120 {
+		picture.SetNRGBA(x, 0, color.NRGBA{R: uint8(x), A: 255})
+	}
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, picture); err != nil {
+		t.Fatal(err)
+	}
+	displayImage := &protocol.Image{MediaType: "image/png", Width: 120, Height: 1, Data: encoded.Bytes()}
+	prepared, err := history.PrepareImage(displayImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	displayImage.Data[0] ^= 0xff // the prepared value must not depend on later source bytes
+	entry := candidate("with image", time.Minute)
+	entry.Image = displayImage
+	added := do(t, owner, Command{Kind: Add, Candidate: entry, PreparedHistoryImage: &prepared})
+	active := snapshot(t, owner)
+	if len(active.Active) != 1 || active.Active[0].Image == nil || active.Active[0].Image.Width != 120 {
+		t.Fatalf("active image = %#v, want original 120px image", active.Active)
+	}
+	do(t, owner, Command{Kind: Dismiss, ID: added.ID})
+	closed := snapshot(t, owner)
+	if len(closed.History) != 1 || closed.History[0].Image == nil || closed.History[0].Image.Width != 96 {
+		t.Fatalf("history = %#v, want normalized 96px image", closed.History)
+	}
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := history.OpenAt(stateHome, clock.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	entries := reopened.Entries()
+	if len(entries) != 1 || entries[0].Image == nil || entries[0].Image.Width != 96 {
+		t.Fatalf("reopened history = %#v, want normalized 96px image", entries)
 	}
 }
 

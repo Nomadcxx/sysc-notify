@@ -16,6 +16,21 @@ import (
 
 const historyImageLongEdge = 96
 
+// PreparedImage is a validated image normalized for retained history.
+// Its contents stay private so Store.AddPrepared can skip repeating the PNG work.
+type PreparedImage struct {
+	image *protocol.Image
+}
+
+// PrepareImage validates and downsizes an image for retained history.
+func PrepareImage(source *protocol.Image) (PreparedImage, error) {
+	image, err := normalizeHistoryImage(source)
+	if err != nil {
+		return PreparedImage{}, err
+	}
+	return PreparedImage{image: image}, nil
+}
+
 func normalizeHistoryImage(source *protocol.Image) (*protocol.Image, error) {
 	if source == nil {
 		return nil, nil

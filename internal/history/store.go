@@ -278,12 +278,18 @@ func (s *Store) IDs() []uint32 {
 }
 
 func (s *Store) Add(entry protocol.HistoryEntry, now time.Time) (protocol.HistoryEntry, []uint32, error) {
-	entry.Timestamp = entry.Timestamp.UTC()
-	image, err := normalizeHistoryImage(entry.Image)
+	image, err := PrepareImage(entry.Image)
 	if err != nil {
 		return protocol.HistoryEntry{}, nil, err
 	}
-	entry.Image = image
+	return s.AddPrepared(entry, image, now)
+}
+
+// AddPrepared stores an image normalized before the caller entered a serialized
+// state owner. PrepareImage is the only constructor for a non-empty value.
+func (s *Store) AddPrepared(entry protocol.HistoryEntry, image PreparedImage, now time.Time) (protocol.HistoryEntry, []uint32, error) {
+	entry.Timestamp = entry.Timestamp.UTC()
+	entry.Image = image.image
 	if err := entry.Validate(); err != nil {
 		return protocol.HistoryEntry{}, nil, err
 	}

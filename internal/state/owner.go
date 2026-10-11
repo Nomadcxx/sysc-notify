@@ -84,16 +84,17 @@ const (
 )
 
 type Command struct {
-	Kind           CommandKind
-	Candidate      notify.Candidate
-	Producer       *protocol.ProducerRequest
-	ID             uint32
-	ActionKey      string
-	ReplyText      string
-	Generation     uint64
-	NextGeneration uint64
-	IDs            []uint32
-	Presentations  []protocol.Presentation
+	Kind                 CommandKind
+	Candidate            notify.Candidate
+	PreparedHistoryImage *history.PreparedImage
+	Producer             *protocol.ProducerRequest
+	ID                   uint32
+	ActionKey            string
+	ReplyText            string
+	Generation           uint64
+	NextGeneration       uint64
+	IDs                  []uint32
+	Presentations        []protocol.Presentation
 }
 
 type Result struct {
@@ -233,6 +234,7 @@ func (o *Owner) run(clock Clock, sink Sink, store *history.Store) {
 type record struct {
 	notification protocol.Notification
 	candidate    notify.Candidate
+	historyImage *history.PreparedImage
 	producerKey  string
 	duration     time.Duration
 	state        protocol.PresentationState
@@ -269,7 +271,7 @@ func (s *ownerState) do(command Command) (Result, error) {
 	now := s.clock.Now()
 	switch command.Kind {
 	case Add:
-		return s.add(command.Candidate, now)
+		return s.add(command.Candidate, command.PreparedHistoryImage, now)
 	case ProducerPublish:
 		return s.publishProducer(command.Producer, now)
 	case ProducerClose:
@@ -351,11 +353,11 @@ func (s *ownerState) requirePresenter(generation uint64) error {
 	return nil
 }
 
-func (s *ownerState) add(candidate notify.Candidate, now time.Time) (Result, error) {
-	return s.addWithProducerKey(candidate, "", now)
+func (s *ownerState) add(candidate notify.Candidate, prepared *history.PreparedImage, now time.Time) (Result, error) {
+	return s.addWithProducerKey(candidate, "", prepared, now)
 }
 
-func (s *ownerState) addWithProducerKey(candidate notify.Candidate, producerKey string, now time.Time) (Result, error) {
+func (s *ownerState) addWithProducerKey(candidate notify.Candidate, producerKey string, prepared *history.PreparedImage, now time.Time) (Result, error) {
 	if err := validateCandidate(candidate, now); err != nil {
 		return Result{}, err
 	}
@@ -373,6 +375,7 @@ func (s *ownerState) addWithProducerKey(candidate notify.Candidate, producerKey 
 	record := &record{
 		notification: notification,
 		candidate:    candidate,
+		historyImage: prepared,
 		producerKey:  producerKey,
 		duration:     duration,
 		state:        protocol.PresentationSuppressed,
@@ -432,7 +435,7 @@ func (s *ownerState) publishProducer(request *protocol.ProducerRequest, now time
 		ReplacesID: replacesID, Urgency: request.Urgency, ExpireTimeout: request.ExpireTimeoutMS,
 		Transient: true, Value: value,
 	}
-	result, err := s.addWithProducerKey(candidate, request.Key, now)
+	result, err := s.addWithProducerKey(candidate, request.Key, nil, now)
 	if err != nil {
 		return Result{}, err
 	}
@@ -531,7 +534,19 @@ func (s *ownerState) close(id uint32, reason protocol.CloseReason) error {
 	s.publishDelta(protocol.Delta{Kind: protocol.DeltaClosed, ID: id, CloseReason: reason})
 	if s.history != nil && !record.candidate.Transient && !record.candidate.Private {
 		now := s.clock.Now()
-		entry, removed, err := s.history.Add(historyEntry(record.notification, now), now)
+		image := record.notification.Image
+		if record.historyImage != nil {
+			image = nil
+		}
+		historyRecord := historyEntry(record.notification, now, image)
+		var entry protocol.HistoryEntry
+		var removed []uint32
+		var err error
+		if record.historyImage != nil {
+			entry, removed, err = s.history.AddPrepared(historyRecord, *record.historyImage, now)
+		} else {
+			entry, removed, err = s.history.Add(historyRecord, now)
+		}
 		if err != nil {
 			// The close has happened and been announced; history records it
 			// but cannot undo it, so a failed write costs only the entry.
@@ -550,12 +565,12 @@ func (s *ownerState) close(id uint32, reason protocol.CloseReason) error {
 
 // historyEntry stamps the entry with its close time: retention measures how
 // long ago a notification left, not how long it was shown.
-func historyEntry(notification protocol.Notification, closedAt time.Time) protocol.HistoryEntry {
+func historyEntry(notification protocol.Notification, closedAt time.Time, image *protocol.Image) protocol.HistoryEntry {
 	return protocol.HistoryEntry{
 		ID: notification.ID, AppName: notification.AppName, AppIcon: notification.AppIcon,
 		DesktopEntry: notification.DesktopEntry, Summary: notification.Summary, Body: notification.Body,
 		Urgency: notification.Urgency, Category: notification.Category, Timestamp: closedAt.UTC(),
-		Image: cloneImage(notification.Image),
+		Image: cloneImage(image),
 	}
 }
 

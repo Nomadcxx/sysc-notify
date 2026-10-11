@@ -10,6 +10,7 @@ import (
 
 	"github.com/godbus/dbus/v5"
 
+	"github.com/Nomadcxx/sysc-notify/internal/history"
 	"github.com/Nomadcxx/sysc-notify/internal/notify"
 	sendermeta "github.com/Nomadcxx/sysc-notify/internal/sender"
 	"github.com/Nomadcxx/sysc-notify/internal/state"
@@ -276,6 +277,12 @@ func (e endpoint) Notify(msg dbus.Message, sender dbus.Sender, appName string, r
 		e.server.order.Enter(msg)()
 		return 0, busError(dbusInvalidArgs, err)
 	}
+	var preparedHistoryImage *history.PreparedImage
+	if candidate.Image != nil && !candidate.Transient && !candidate.Private {
+		if prepared, prepareErr := history.PrepareImage(candidate.Image); prepareErr == nil {
+			preparedHistoryImage = &prepared
+		}
+	}
 	// The slow preprocessing above stays outside the ordered section; from here
 	// on this sender's later calls wait, so the update reaches state before a
 	// CloseNotification the client pipelined behind it.
@@ -285,7 +292,9 @@ func (e endpoint) Notify(msg dbus.Message, sender dbus.Sender, appName string, r
 	if owner == nil {
 		return 0, busError(dbusFailed, errors.New("notification state unavailable"))
 	}
-	result, err := owner.Do(context.Background(), state.Command{Kind: state.Add, Candidate: candidate})
+	result, err := owner.Do(context.Background(), state.Command{
+		Kind: state.Add, Candidate: candidate, PreparedHistoryImage: preparedHistoryImage,
+	})
 	if err != nil {
 		return 0, busError(dbusFailed, err)
 	}
