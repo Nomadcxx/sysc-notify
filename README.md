@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/wordmark.png">
-    <img src="assets/wordmark-light.png" alt="sysc-notify" height="64">
-  </picture>
+  <img src="assets/header.webp" alt="sysc-notify" height="64">
 </p>
 
 
@@ -10,7 +7,7 @@ A notification daemon for sysc-shell. Implements `org.freedesktop.Notifications`
 session bus and streams notification state to the shell over a Unix socket.
 
 <p align="center">
-  <img src="assets/toasts.webp" alt="Three sysc-shell notification toasts: a critical backup failure, a message and a calendar reminder" width="560">
+  <img loading="lazy" src="assets/toasts.webp" alt="Three sysc-shell notification toasts: a critical backup failure, a message and a calendar reminder" width="560">
 </p>
 
 ## Quick Links
