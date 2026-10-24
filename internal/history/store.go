@@ -59,6 +59,15 @@ func cloneRetained(entries []retained) []retained {
 	return cloned
 }
 
+func cloneEntry(entry protocol.HistoryEntry) protocol.HistoryEntry {
+	if entry.Image != nil {
+		image := *entry.Image
+		image.Data = bytes.Clone(image.Data)
+		entry.Image = &image
+	}
+	return entry
+}
+
 // documentOverhead is the size of the encoded document around its entries:
 // the version, the array and the trailing newline.
 var documentOverhead = func() int {
@@ -314,15 +323,13 @@ func (s *Store) Close() error {
 	return err
 }
 
-// Entries returns a copy of the retained entries. The images in the copy are
-// the ones the store holds: they are immutable, and a caller must treat them
-// as read-only.
+// Entries returns copies of the retained entries and their image data.
 func (s *Store) Entries() []protocol.HistoryEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entries := make([]protocol.HistoryEntry, len(s.entries))
 	for i := range s.entries {
-		entries[i] = s.entries[i].entry
+		entries[i] = cloneEntry(s.entries[i].entry)
 	}
 	return entries
 }
@@ -383,7 +390,7 @@ func (s *Store) AddPrepared(entry protocol.HistoryEntry, image PreparedImage, no
 	s.entries = next
 	s.schedule()
 	s.mu.Unlock()
-	return entry, removed, nil
+	return cloneEntry(entry), removed, nil
 }
 
 // trimToBudget drops the oldest entries until the encoded document fits the
@@ -507,11 +514,15 @@ func (s *Store) Clear() ([]uint32, error) {
 // directory sync) and cleans up orphaned image sidecars. It is called only by
 // the persistence loop or during OpenAt; it never touches s.entries.
 func (s *Store) commit(entries []retained) error {
+	var sidecarBuffer []byte
 	for i := range entries {
 		if entries[i].meta == nil {
 			continue
 		}
-		if err := writeImage(s.imageDir, entries[i].entry.Image, entries[i].meta); err != nil {
+		if sidecarBuffer == nil {
+			sidecarBuffer = make([]byte, 32*1024)
+		}
+		if err := writeImage(s.imageDir, entries[i].entry.Image, entries[i].meta, sidecarBuffer); err != nil {
 			return fmt.Errorf("history: write image: %w", err)
 		}
 	}
@@ -558,12 +569,9 @@ func (s *Store) commit(entries []retained) error {
 }
 
 func readPrivateRegularFile(path string, limit int64) ([]byte, error) {
-	info, err := os.Lstat(path)
+	info, err := privateRegularFileInfo(path)
 	if err != nil {
 		return nil, err
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-		return nil, fmt.Errorf("history: unsafe file %q", path)
 	}
 	if info.Size() > limit {
 		return nil, fmt.Errorf("%w: %q exceeds %d bytes", errFileTooLarge, path, limit)

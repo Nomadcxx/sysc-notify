@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"image"
 	"image/png"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -16,18 +17,18 @@ import (
 
 const historyImageLongEdge = 96
 
-// readSidecar reads a sidecar file. It is a variable so a test can count how
-// many sidecars a commit reads.
-var readSidecar = readPrivateRegularFile
+// hashSidecar is a variable so a test can count digest verifications.
+var hashSidecar = hashPrivateRegularFile
 
 // imageMeta is what the store remembers about an image once it has been
-// hashed: the digest that names its sidecar and the dimensions the sidecar
-// records. The digest is computed once, when the image is prepared or loaded,
-// and reused for every later write and for every encoded document.
+// hashed: the digest and dimensions, plus the verified file identity used to
+// skip reads while the sidecar remains unchanged. A changed file is hashed
+// again before the store trusts it.
 type imageMeta struct {
-	digest string
-	width  uint32
-	height uint32
+	digest   string
+	width    uint32
+	height   uint32
+	fileInfo os.FileInfo
 }
 
 // PreparedImage is a validated image normalized for retained history.
@@ -118,7 +119,7 @@ func loadImage(dir string, reference *diskImage) (*protocol.Image, *imageMeta, e
 		return nil, nil, errors.New("invalid image digest")
 	}
 	path := filepath.Join(dir, reference.SHA256+".png")
-	contents, err := readSidecar(path, protocol.MaxWireImageBytes)
+	contents, err := readPrivateRegularFile(path, protocol.MaxWireImageBytes)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -137,22 +138,40 @@ func loadImage(dir string, reference *diskImage) (*protocol.Image, *imageMeta, e
 	if err := result.Validate(); err != nil {
 		return nil, nil, err
 	}
-	meta := &imageMeta{digest: reference.SHA256, width: reference.Width, height: reference.Height}
+	info, err := privateRegularFileInfo(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	meta := &imageMeta{digest: reference.SHA256, width: reference.Width, height: reference.Height, fileInfo: info}
 	return result, meta, nil
 }
 
-// writeImage stores the image as a content-addressed sidecar. A sidecar that
-// is already on disk is left alone: this process wrote it, or the startup path
-// verified it, and reading it back to hash and decode it again is the work
-// this path avoids. A sidecar that was removed while the daemon runs is
-// written again, because the stat says it is gone.
-func writeImage(dir string, source *protocol.Image, meta *imageMeta) error {
+// writeImage stores the image as a content-addressed sidecar. An existing
+// sidecar is trusted only while its private file identity and metadata match
+// the verified snapshot. A changed sidecar is hashed and restored from the
+// retained image when its digest no longer matches.
+func writeImage(dir string, source *protocol.Image, meta *imageMeta, buffer []byte) error {
 	if source == nil || meta == nil {
 		return nil
 	}
 	path := filepath.Join(dir, meta.digest+".png")
-	if _, err := os.Lstat(path); err == nil {
-		return nil
+	replace := false
+	if info, err := privateRegularFileInfo(path); err == nil {
+		if sameSidecarInfo(meta.fileInfo, info) {
+			return nil
+		}
+		digest, verifiedInfo, err := hashSidecar(path, protocol.MaxWireImageBytes, buffer)
+		if err == nil {
+			if hex.EncodeToString(digest[:]) == meta.digest {
+				meta.fileInfo = verifiedInfo
+				return nil
+			}
+			replace = true
+		} else if errors.Is(err, errFileTooLarge) {
+			replace = true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("history: inspect image sidecar: %w", err)
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("history: inspect image sidecar: %w", err)
 	}
@@ -177,13 +196,110 @@ func writeImage(dir string, source *protocol.Image, meta *imageMeta) error {
 	if err := temporary.Close(); err != nil {
 		return fmt.Errorf("history: close image temporary file: %w", err)
 	}
+	if replace {
+		if err := os.Rename(temporaryName, path); err != nil {
+			return fmt.Errorf("history: restore image sidecar: %w", err)
+		}
+		if err := syncDirectory(dir); err != nil {
+			return err
+		}
+		info, err := privateRegularFileInfo(path)
+		if err != nil {
+			return err
+		}
+		meta.fileInfo = info
+		return nil
+	}
 	if err := os.Link(temporaryName, path); err != nil {
 		if errors.Is(err, os.ErrExist) {
-			return writeImage(dir, source, meta)
+			return writeImage(dir, source, meta, buffer)
 		}
 		return fmt.Errorf("history: commit image: %w", err)
 	}
-	return syncDirectory(dir)
+	if err := os.Remove(temporaryName); err != nil {
+		return fmt.Errorf("history: remove image temporary file: %w", err)
+	}
+	if err := syncDirectory(dir); err != nil {
+		return err
+	}
+	info, err := privateRegularFileInfo(path)
+	if err != nil {
+		return err
+	}
+	meta.fileInfo = info
+	return nil
+}
+
+// hashPrivateRegularFile hashes a sidecar without allocating its full
+// contents. The file identity is checked before and after reading so a path
+// replaced during verification cannot be trusted.
+func hashPrivateRegularFile(path string, limit int64, buffer []byte) ([sha256.Size]byte, os.FileInfo, error) {
+	var digest [sha256.Size]byte
+	info, err := privateRegularFileInfo(path)
+	if err != nil {
+		return digest, nil, err
+	}
+	if info.Size() > limit {
+		return digest, nil, fmt.Errorf("%w: %q exceeds %d bytes", errFileTooLarge, path, limit)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return digest, nil, err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil {
+		return digest, nil, err
+	}
+	if !opened.Mode().IsRegular() || opened.Mode().Perm() != 0o600 || !os.SameFile(info, opened) {
+		return digest, nil, fmt.Errorf("history: unsafe file %q", path)
+	}
+	if len(buffer) == 0 {
+		buffer = make([]byte, 32*1024)
+	}
+	h := sha256.New()
+	size, err := io.CopyBuffer(h, io.LimitReader(file, limit+1), buffer)
+	if err != nil {
+		return digest, nil, err
+	}
+	if size > limit {
+		return digest, nil, fmt.Errorf("%w: %q exceeds %d bytes", errFileTooLarge, path, limit)
+	}
+	current, err := file.Stat()
+	if err != nil {
+		return digest, nil, err
+	}
+	pathInfo, err := privateRegularFileInfo(path)
+	if err != nil {
+		return digest, nil, err
+	}
+	if current.Size() != opened.Size() || !current.ModTime().Equal(opened.ModTime()) ||
+		!sameFileChangeTime(opened, current) || !os.SameFile(current, pathInfo) ||
+		pathInfo.Size() != current.Size() || !pathInfo.ModTime().Equal(current.ModTime()) ||
+		!sameFileChangeTime(current, pathInfo) {
+		return digest, nil, fmt.Errorf("history: image sidecar changed during verification: %q", path)
+	}
+	copy(digest[:], h.Sum(digest[:0]))
+	return digest, pathInfo, nil
+}
+
+func privateRegularFileInfo(path string) (os.FileInfo, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return nil, fmt.Errorf("history: unsafe file %q", path)
+	}
+	return info, nil
+}
+
+// sameSidecarInfo also compares Linux ctime, so an in-place edit with its
+// modtime restored still invalidates the snapshot.
+func sameSidecarInfo(verified, current os.FileInfo) bool {
+	return verified != nil && os.SameFile(verified, current) &&
+		verified.Size() == current.Size() && verified.ModTime().Equal(current.ModTime()) &&
+		sameFileChangeTime(verified, current)
 }
 
 // cleanupImages removes the sidecars that no entry refers to. The references

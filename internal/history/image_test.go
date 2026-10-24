@@ -59,28 +59,28 @@ func imageStore(t *testing.T, stateHome string, now time.Time, ids []uint32) (*S
 	return store, images
 }
 
-// TestCommitNeverReadsAStoredSidecar pins the steady-state cost of a commit:
-// a sidecar this process already placed is left alone. Reading, hashing and
-// decoding every retained sidecar on every commit was issue #61.
-func TestCommitNeverReadsAStoredSidecar(t *testing.T) {
+// TestCommitReusesUnchangedSidecarVerification pins the steady-state fast
+// path: a sidecar whose file identity, size and modtime still match its
+// verified snapshot is not read again.
+func TestCommitReusesUnchangedSidecarVerification(t *testing.T) {
 	stateHome := t.TempDir()
 	now := time.Date(2026, 8, 30, 10, 15, 0, 0, time.UTC)
 	ids := []uint32{1, 2, 3}
 	store, _ := imageStore(t, stateHome, now, ids)
 
-	reads := 0
-	realRead := readSidecar
-	readSidecar = func(path string, limit int64) ([]byte, error) {
-		reads++
-		return realRead(path, limit)
+	hashes := 0
+	realHash := hashSidecar
+	hashSidecar = func(path string, limit int64, buffer []byte) ([32]byte, os.FileInfo, error) {
+		hashes++
+		return realHash(path, limit, buffer)
 	}
-	t.Cleanup(func() { readSidecar = realRead })
+	t.Cleanup(func() { hashSidecar = realHash })
 
 	if err := store.commit(cloneRetained(store.entries)); err != nil {
 		t.Fatal(err)
 	}
-	if reads != 0 {
-		t.Fatalf("a steady-state commit read %d sidecars, want 0", reads)
+	if hashes != 0 {
+		t.Fatalf("a steady-state commit hashed %d unchanged sidecars, want 0", hashes)
 	}
 }
 
@@ -105,6 +105,108 @@ func TestCommitRewritesASidecarRemovedExternally(t *testing.T) {
 	}
 	if !bytes.Equal(contents, images[7].Data) && !bytes.Equal(contents, store.entries[0].entry.Image.Data) {
 		t.Fatal("the rewritten sidecar is not the retained image")
+	}
+}
+
+func TestCommitRepairsACorruptExistingSidecar(t *testing.T) {
+	stateHome := t.TempDir()
+	now := time.Date(2026, 8, 30, 10, 15, 0, 0, time.UTC)
+	store, _ := imageStore(t, stateHome, now, []uint32{11})
+	entry := store.entries[0]
+	sidecar := filepath.Join(stateHome, "sysc-notify", "images", entry.meta.digest+".png")
+	corrupt := bytes.Clone(entry.entry.Image.Data)
+	corrupt[0] ^= 0xff
+	replacement := sidecar + ".replacement"
+	if err := os.WriteFile(replacement, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	verifiedTime := entry.meta.fileInfo.ModTime()
+	if err := os.Chtimes(replacement, verifiedTime, verifiedTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, sidecar); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.commit(cloneRetained(store.entries)); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(sidecar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(contents, entry.entry.Image.Data) {
+		t.Fatal("commit did not restore the retained image bytes")
+	}
+
+	reopened, err := OpenAt(stateHome, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reopened.Close() }()
+	entries := reopened.Entries()
+	if len(entries) != 1 || entries[0].Image == nil {
+		t.Fatalf("reopened entries = %#v, want the image retained", entries)
+	}
+}
+
+func TestCommitRepairsAnInPlaceEditWithRestoredModtime(t *testing.T) {
+	stateHome := t.TempDir()
+	now := time.Date(2026, 8, 30, 10, 15, 0, 0, time.UTC)
+	store, _ := imageStore(t, stateHome, now, []uint32{13})
+	entry := store.entries[0]
+	sidecar := filepath.Join(stateHome, "sysc-notify", "images", entry.meta.digest+".png")
+	verifiedInfo, err := os.Stat(sidecar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := bytes.Clone(entry.entry.Image.Data)
+	corrupt[0] ^= 0xff
+	if err := os.WriteFile(sidecar, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(sidecar, verifiedInfo.ModTime(), verifiedInfo.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	currentInfo, err := os.Stat(sidecar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(verifiedInfo, currentInfo) || verifiedInfo.Size() != currentInfo.Size() || !verifiedInfo.ModTime().Equal(currentInfo.ModTime()) {
+		t.Fatal("test did not preserve sidecar identity, size and modtime")
+	}
+
+	if err := store.commit(cloneRetained(store.entries)); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(sidecar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(contents, entry.entry.Image.Data) {
+		t.Fatal("commit did not restore the retained image bytes")
+	}
+}
+
+func TestCommitRepairsAnOversizedSidecar(t *testing.T) {
+	stateHome := t.TempDir()
+	now := time.Date(2026, 8, 30, 10, 15, 0, 0, time.UTC)
+	store, _ := imageStore(t, stateHome, now, []uint32{12})
+	entry := store.entries[0]
+	sidecar := filepath.Join(stateHome, "sysc-notify", "images", entry.meta.digest+".png")
+	if err := os.Truncate(sidecar, protocol.MaxWireImageBytes+1); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.commit(cloneRetained(store.entries)); err != nil {
+		t.Fatalf("commit could not repair the oversized sidecar: %v", err)
+	}
+	contents, err := os.ReadFile(sidecar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(contents, entry.entry.Image.Data) {
+		t.Fatal("commit did not restore the retained image bytes")
 	}
 }
 
@@ -183,22 +285,47 @@ func TestAddPreparedReusesThePreparedDigest(t *testing.T) {
 	}
 }
 
-// TestEntriesShareRetainedImagesWithoutCopying them: an Entries call copies
-// the entry structs, never the image bytes behind them.
-func TestEntriesShareRetainedImagesWithoutCopying(t *testing.T) {
+func TestEntriesReturnsIndependentImages(t *testing.T) {
 	stateHome := t.TempDir()
 	now := time.Date(2026, 8, 30, 10, 15, 0, 0, time.UTC)
 	store, _ := imageStore(t, stateHome, now, []uint32{1})
 
 	first := store.Entries()
 	second := store.Entries()
-	if first[0].Image != second[0].Image {
-		t.Fatal("Entries deep-copied the retained image")
+	if first[0].Image == second[0].Image {
+		t.Fatal("Entries exposed the retained image pointer")
 	}
-	// The returned structs are private to the caller.
+	original := bytes.Clone(store.entries[0].entry.Image.Data)
+	first[0].Image.Data[0] ^= 0xff
+	if !bytes.Equal(store.Entries()[0].Image.Data, original) {
+		t.Fatal("mutating a returned image changed the store")
+	}
 	first[0].Summary = "mutated"
 	if store.Entries()[0].Summary != "record" {
 		t.Fatal("mutating a returned entry changed the store")
+	}
+}
+
+func TestAddPreparedReturnsAnIndependentImage(t *testing.T) {
+	stateHome := t.TempDir()
+	now := time.Date(2026, 8, 30, 10, 15, 0, 0, time.UTC)
+	store, err := OpenAt(stateHome, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	prepared, err := PrepareImage(distinctPNG(t, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	added, _, err := store.AddPrepared(testEntry(1, now), prepared, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := bytes.Clone(store.entries[0].entry.Image.Data)
+	added.Image.Data[0] ^= 0xff
+	if !bytes.Equal(store.Entries()[0].Image.Data, original) {
+		t.Fatal("mutating AddPrepared's result changed the store")
 	}
 }
 
