@@ -16,10 +16,25 @@ import (
 
 const historyImageLongEdge = 96
 
+// readSidecar reads a sidecar file. It is a variable so a test can count how
+// many sidecars a commit reads.
+var readSidecar = readPrivateRegularFile
+
+// imageMeta is what the store remembers about an image once it has been
+// hashed: the digest that names its sidecar and the dimensions the sidecar
+// records. The digest is computed once, when the image is prepared or loaded,
+// and reused for every later write and for every encoded document.
+type imageMeta struct {
+	digest string
+	width  uint32
+	height uint32
+}
+
 // PreparedImage is a validated image normalized for retained history.
 // Its contents stay private so Store.AddPrepared can skip repeating the PNG work.
 type PreparedImage struct {
 	image *protocol.Image
+	meta  *imageMeta
 }
 
 // PrepareImage validates and downsizes an image for retained history.
@@ -28,7 +43,17 @@ func PrepareImage(source *protocol.Image) (PreparedImage, error) {
 	if err != nil {
 		return PreparedImage{}, err
 	}
-	return PreparedImage{image: image}, nil
+	if image == nil {
+		return PreparedImage{}, nil
+	}
+	return PreparedImage{image: image, meta: newImageMeta(image)}, nil
+}
+
+// newImageMeta hashes an image once and keeps the digest that names its
+// sidecar, so no later write or document has to hash it again.
+func newImageMeta(source *protocol.Image) *imageMeta {
+	digest := sha256.Sum256(source.Data)
+	return &imageMeta{digest: hex.EncodeToString(digest[:]), width: source.Width, height: source.Height}
 }
 
 func normalizeHistoryImage(source *protocol.Image) (*protocol.Image, error) {
@@ -68,60 +93,65 @@ func normalizeHistoryImage(source *protocol.Image) (*protocol.Image, error) {
 	}, nil
 }
 
-func imageReference(source *protocol.Image) *diskImage {
-	if source == nil {
+// imageReference builds the on-disk reference of an image from the digest
+// that was computed when the image was prepared or loaded.
+func imageReference(meta *imageMeta) *diskImage {
+	if meta == nil {
 		return nil
 	}
-	digest := sha256.Sum256(source.Data)
-	return &diskImage{SHA256: hex.EncodeToString(digest[:]), Width: source.Width, Height: source.Height}
+	return &diskImage{SHA256: meta.digest, Width: meta.width, Height: meta.height}
 }
 
-func loadImage(dir string, reference *diskImage) (*protocol.Image, error) {
+// loadImage reads a sidecar and verifies it against the reference that named
+// it. It returns the image and the metadata that names its sidecar, so the
+// digest is not computed again later.
+func loadImage(dir string, reference *diskImage) (*protocol.Image, *imageMeta, error) {
 	if reference == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if len(reference.SHA256) != sha256.Size*2 || reference.Width == 0 || reference.Height == 0 ||
 		reference.Width > historyImageLongEdge || reference.Height > historyImageLongEdge {
-		return nil, errors.New("invalid image reference")
+		return nil, nil, errors.New("invalid image reference")
 	}
 	digest, err := hex.DecodeString(reference.SHA256)
 	if err != nil || hex.EncodeToString(digest) != reference.SHA256 {
-		return nil, errors.New("invalid image digest")
+		return nil, nil, errors.New("invalid image digest")
 	}
 	path := filepath.Join(dir, reference.SHA256+".png")
-	contents, err := readPrivateRegularFile(path, protocol.MaxWireImageBytes)
+	contents, err := readSidecar(path, protocol.MaxWireImageBytes)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	actual := sha256.Sum256(contents)
 	if !bytes.Equal(actual[:], digest) {
-		return nil, errors.New("image digest mismatch")
+		return nil, nil, errors.New("image digest mismatch")
 	}
 	result := &protocol.Image{MediaType: "image/png", Width: reference.Width, Height: reference.Height, Data: contents}
 	decoded, err := png.Decode(bytes.NewReader(contents))
 	if err != nil {
-		return nil, fmt.Errorf("decode sidecar: %w", err)
+		return nil, nil, fmt.Errorf("decode sidecar: %w", err)
 	}
 	if bounds := decoded.Bounds(); bounds.Dx() != int(reference.Width) || bounds.Dy() != int(reference.Height) {
-		return nil, errors.New("sidecar dimensions do not match reference")
+		return nil, nil, errors.New("sidecar dimensions do not match reference")
 	}
-	return result, result.Validate()
+	if err := result.Validate(); err != nil {
+		return nil, nil, err
+	}
+	meta := &imageMeta{digest: reference.SHA256, width: reference.Width, height: reference.Height}
+	return result, meta, nil
 }
 
-func writeImage(dir string, source *protocol.Image) error {
-	if source == nil {
+// writeImage stores the image as a content-addressed sidecar. A sidecar that
+// is already on disk is left alone: this process wrote it, or the startup path
+// verified it, and reading it back to hash and decode it again is the work
+// this path avoids. A sidecar that was removed while the daemon runs is
+// written again, because the stat says it is gone.
+func writeImage(dir string, source *protocol.Image, meta *imageMeta) error {
+	if source == nil || meta == nil {
 		return nil
 	}
-	reference := imageReference(source)
-	path := filepath.Join(dir, reference.SHA256+".png")
+	path := filepath.Join(dir, meta.digest+".png")
 	if _, err := os.Lstat(path); err == nil {
-		existing, err := loadImage(dir, reference)
-		if err != nil {
-			return fmt.Errorf("history: existing image sidecar: %w", err)
-		}
-		if !bytes.Equal(existing.Data, source.Data) {
-			return errors.New("history: image sidecar content mismatch")
-		}
 		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("history: inspect image sidecar: %w", err)
@@ -149,18 +179,20 @@ func writeImage(dir string, source *protocol.Image) error {
 	}
 	if err := os.Link(temporaryName, path); err != nil {
 		if errors.Is(err, os.ErrExist) {
-			return writeImage(dir, source)
+			return writeImage(dir, source, meta)
 		}
 		return fmt.Errorf("history: commit image: %w", err)
 	}
 	return syncDirectory(dir)
 }
 
-func cleanupImages(dir string, entries []protocol.HistoryEntry) error {
-	references := make(map[string]struct{})
-	for _, entry := range entries {
-		if reference := imageReference(entry.Image); reference != nil {
-			references[reference.SHA256+".png"] = struct{}{}
+// cleanupImages removes the sidecars that no entry refers to. The references
+// come from the digests the store already knows, so no image is hashed again.
+func cleanupImages(dir string, entries []retained) error {
+	references := make(map[string]struct{}, len(entries))
+	for i := range entries {
+		if entries[i].meta != nil {
+			references[entries[i].meta.digest+".png"] = struct{}{}
 		}
 	}
 	directory, err := os.ReadDir(dir)

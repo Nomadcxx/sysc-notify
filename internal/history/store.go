@@ -31,6 +31,60 @@ const (
 // daemon starts with empty history.
 var errFileTooLarge = errors.New("history: file exceeds size limit")
 
+// retained is one history entry with what the store remembers about it: the
+// metadata of its image and the size of its encoded form. Both are derived
+// from data that never changes, so they are computed once and carried along
+// instead of being hashed and measured again on every mutation.
+type retained struct {
+	entry protocol.HistoryEntry
+	meta  *imageMeta
+	size  int
+}
+
+// newRetained pairs an entry with its image metadata and measures the entry
+// as it is written to history.json.
+func newRetained(entry protocol.HistoryEntry, meta *imageMeta) (retained, error) {
+	encoded, err := json.Marshal(diskEntryOf(retained{entry: entry, meta: meta}))
+	if err != nil {
+		return retained{}, fmt.Errorf("history: measure entry %d: %w", entry.ID, err)
+	}
+	return retained{entry: entry, meta: meta, size: len(encoded)}, nil
+}
+
+// cloneRetained copies the entry list. The images are immutable once
+// prepared, so the copy shares them instead of copying their bytes.
+func cloneRetained(entries []retained) []retained {
+	cloned := make([]retained, len(entries))
+	copy(cloned, entries)
+	return cloned
+}
+
+// documentOverhead is the size of the encoded document around its entries:
+// the version, the array and the trailing newline.
+var documentOverhead = func() int {
+	empty, err := json.Marshal(document{Version: schemaVersion, Entries: []diskEntry{}})
+	if err != nil {
+		return 0
+	}
+	return len(empty) + 1
+}()
+
+// documentBytes is the exact size of the encoded document for the entries.
+// The entry sizes are measured when the entries are added, so the write
+// budget is checked without marshalling the document.
+func documentBytes(entries []retained) int {
+	if len(entries) == 0 {
+		return documentOverhead
+	}
+	// The empty array of the overhead gains the entries between its brackets,
+	// and every entry but the first adds a comma.
+	total := documentOverhead + len(entries) - 1
+	for i := range entries {
+		total += entries[i].size
+	}
+	return total
+}
+
 // Store keeps the retained history in memory as the authoritative state and
 // persists it on a background goroutine. Mutations (Add, Sweep, Remove,
 // MarkSeen, Clear) update the in-memory entries synchronously so snapshots
@@ -43,7 +97,7 @@ type Store struct {
 
 	mu        sync.Mutex
 	cond      *sync.Cond
-	entries   []protocol.HistoryEntry // authoritative in-memory state
+	entries   []retained // authoritative in-memory state
 	dirty     bool
 	writeGen  int // incremented by every mutation
 	workerGen int // generation durably committed (or attempted)
@@ -128,7 +182,7 @@ func OpenAt(stateHome string, now time.Time) (*Store, error) {
 	}
 	retained := retain(store.entries, now)
 	if len(retained) != len(store.entries) {
-		store.entries = cloneEntries(retained)
+		store.entries = retained
 		if err := store.commit(retained); err != nil {
 			return nil, err
 		}
@@ -155,7 +209,7 @@ func (s *Store) persistLoop() {
 			// on every mutation: the entries are replaced wholesale (never
 			// mutated in place), so reading them under the lock is enough, and
 			// coalesced bursts clone once instead of once per mutation.
-			target := cloneEntries(s.entries)
+			target := cloneRetained(s.entries)
 			gen := s.writeGen
 			s.dirty = false
 			s.mu.Unlock()
@@ -235,9 +289,9 @@ func (s *Store) Close() error {
 		s.mu.Lock()
 		s.closed = true
 		dirty := s.dirty
-		var target []protocol.HistoryEntry
+		var target []retained
 		if dirty {
-			target = cloneEntries(s.entries)
+			target = cloneRetained(s.entries)
 		}
 		s.mu.Unlock()
 		close(s.closing)
@@ -260,10 +314,17 @@ func (s *Store) Close() error {
 	return err
 }
 
+// Entries returns a copy of the retained entries. The images in the copy are
+// the ones the store holds: they are immutable, and a caller must treat them
+// as read-only.
 func (s *Store) Entries() []protocol.HistoryEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return cloneEntries(s.entries)
+	entries := make([]protocol.HistoryEntry, len(s.entries))
+	for i := range s.entries {
+		entries[i] = s.entries[i].entry
+	}
+	return entries
 }
 
 // IDs returns the ids of the retained entries, oldest first.
@@ -272,7 +333,7 @@ func (s *Store) IDs() []uint32 {
 	defer s.mu.Unlock()
 	ids := make([]uint32, len(s.entries))
 	for i, entry := range s.entries {
-		ids[i] = entry.ID
+		ids[i] = entry.entry.ID
 	}
 	return ids
 }
@@ -297,19 +358,24 @@ func (s *Store) AddPrepared(entry protocol.HistoryEntry, image PreparedImage, no
 		return protocol.HistoryEntry{}, nil, nil
 	}
 	s.mu.Lock()
-	next := cloneEntries(s.entries)
+	next := cloneRetained(s.entries)
 	removed := make([]uint32, 0, 2)
 	for i := 0; i < len(next); {
-		if next[i].ID == entry.ID || next[i].Timestamp.Before(now.Add(-protocol.HistoryRetention)) {
-			removed = append(removed, next[i].ID)
+		if next[i].entry.ID == entry.ID || next[i].entry.Timestamp.Before(now.Add(-protocol.HistoryRetention)) {
+			removed = append(removed, next[i].entry.ID)
 			next = append(next[:i], next[i+1:]...)
 			continue
 		}
 		i++
 	}
-	next = append(next, entry)
+	added, err := newRetained(entry, image.meta)
+	if err != nil {
+		s.mu.Unlock()
+		return protocol.HistoryEntry{}, nil, err
+	}
+	next = append(next, added)
 	for len(next) > protocol.MaxHistoryEntries {
-		removed = append(removed, next[0].ID)
+		removed = append(removed, next[0].entry.ID)
 		next = next[1:]
 	}
 	next, budgetRemoved := trimToBudget(next)
@@ -317,30 +383,21 @@ func (s *Store) AddPrepared(entry protocol.HistoryEntry, image PreparedImage, no
 	s.entries = next
 	s.schedule()
 	s.mu.Unlock()
-	return cloneEntry(entry), removed, nil
+	return entry, removed, nil
 }
 
 // trimToBudget drops the oldest entries until the encoded document fits the
 // write budget. Without it a history of large escaped bodies could exceed the
-// read limit and be quarantined on the next start.
-func trimToBudget(entries []protocol.HistoryEntry) ([]protocol.HistoryEntry, []uint32) {
+// read limit and be quarantined on the next start. The entry sizes are known,
+// so the document is not marshalled to measure it.
+func trimToBudget(entries []retained) ([]retained, []uint32) {
 	var removed []uint32
 	for len(entries) > 0 {
-		contents, err := json.Marshal(encodeDocument(entries))
-		if err != nil || len(contents)+1 <= maxHistoryWriteBytes {
+		if documentBytes(entries) <= maxHistoryWriteBytes {
 			return entries, removed
 		}
-		drop := (len(contents) + 1 - maxHistoryWriteBytes) / (len(contents) / len(entries))
-		if drop < 1 {
-			drop = 1
-		}
-		if drop > len(entries) {
-			drop = len(entries)
-		}
-		for _, entry := range entries[:drop] {
-			removed = append(removed, entry.ID)
-		}
-		entries = entries[drop:]
+		removed = append(removed, entries[0].entry.ID)
+		entries = entries[1:]
 	}
 	return entries, removed
 }
@@ -348,14 +405,14 @@ func trimToBudget(entries []protocol.HistoryEntry) ([]protocol.HistoryEntry, []u
 func (s *Store) Sweep(now time.Time) ([]uint32, error) {
 	cutoff := now.Add(-protocol.HistoryRetention)
 	s.mu.Lock()
-	next := make([]protocol.HistoryEntry, 0, len(s.entries))
+	next := make([]retained, 0, len(s.entries))
 	removed := make([]uint32, 0)
 	for _, entry := range s.entries {
-		if entry.Timestamp.Before(cutoff) {
-			removed = append(removed, entry.ID)
+		if entry.entry.Timestamp.Before(cutoff) {
+			removed = append(removed, entry.entry.ID)
 			continue
 		}
-		next = append(next, cloneEntry(entry))
+		next = append(next, entry)
 	}
 	if len(removed) == 0 {
 		s.mu.Unlock()
@@ -379,14 +436,14 @@ func (s *Store) Remove(ids []uint32) ([]uint32, error) {
 		drop[id] = struct{}{}
 	}
 	s.mu.Lock()
-	next := make([]protocol.HistoryEntry, 0, len(s.entries))
+	next := make([]retained, 0, len(s.entries))
 	removed := make([]uint32, 0, len(ids))
 	for _, e := range s.entries {
-		if _, ok := drop[e.ID]; ok {
-			removed = append(removed, e.ID)
+		if _, ok := drop[e.entry.ID]; ok {
+			removed = append(removed, e.entry.ID)
 			continue
 		}
-		next = append(next, cloneEntry(e))
+		next = append(next, e)
 	}
 	if len(removed) == 0 {
 		s.mu.Unlock()
@@ -404,12 +461,20 @@ func (s *Store) MarkSeen(ids []uint32) ([]uint32, error) {
 		wanted[id] = struct{}{}
 	}
 	s.mu.Lock()
-	next := cloneEntries(s.entries)
+	next := cloneRetained(s.entries)
 	changed := make([]uint32, 0, len(ids))
 	for i := range next {
-		if _, exists := wanted[next[i].ID]; exists && !next[i].Seen {
-			next[i].Seen = true
-			changed = append(changed, next[i].ID)
+		if _, exists := wanted[next[i].entry.ID]; exists && !next[i].entry.Seen {
+			next[i].entry.Seen = true
+			// The seen flag changes the encoded size of the entry, so the
+			// entry is measured again.
+			measured, err := newRetained(next[i].entry, next[i].meta)
+			if err != nil {
+				s.mu.Unlock()
+				return nil, err
+			}
+			next[i] = measured
+			changed = append(changed, next[i].entry.ID)
 		}
 	}
 	if len(changed) == 0 {
@@ -430,7 +495,7 @@ func (s *Store) Clear() ([]uint32, error) {
 	}
 	removed := make([]uint32, len(s.entries))
 	for i, entry := range s.entries {
-		removed[i] = entry.ID
+		removed[i] = entry.entry.ID
 	}
 	s.entries = nil
 	s.schedule()
@@ -441,12 +506,12 @@ func (s *Store) Clear() ([]uint32, error) {
 // commit writes the given entries atomically (temporary file, fsync, rename,
 // directory sync) and cleans up orphaned image sidecars. It is called only by
 // the persistence loop or during OpenAt; it never touches s.entries.
-func (s *Store) commit(entries []protocol.HistoryEntry) error {
+func (s *Store) commit(entries []retained) error {
 	for i := range entries {
-		if entries[i].Image == nil {
+		if entries[i].meta == nil {
 			continue
 		}
-		if err := writeImage(s.imageDir, entries[i].Image); err != nil {
+		if err := writeImage(s.imageDir, entries[i].entry.Image, entries[i].meta); err != nil {
 			return fmt.Errorf("history: write image: %w", err)
 		}
 	}
@@ -582,35 +647,13 @@ func syncDirectory(path string) error {
 	return nil
 }
 
-func retain(entries []protocol.HistoryEntry, now time.Time) []protocol.HistoryEntry {
+func retain(entries []retained, now time.Time) []retained {
 	cutoff := now.Add(-protocol.HistoryRetention)
-	kept := make([]protocol.HistoryEntry, 0, len(entries))
+	kept := make([]retained, 0, len(entries))
 	for _, entry := range entries {
-		if !entry.Timestamp.Before(cutoff) {
-			kept = append(kept, cloneEntry(entry))
+		if !entry.entry.Timestamp.Before(cutoff) {
+			kept = append(kept, entry)
 		}
 	}
 	return kept
-}
-
-func cloneEntries(entries []protocol.HistoryEntry) []protocol.HistoryEntry {
-	cloned := make([]protocol.HistoryEntry, len(entries))
-	for i, entry := range entries {
-		cloned[i] = cloneEntry(entry)
-	}
-	return cloned
-}
-
-func cloneEntry(entry protocol.HistoryEntry) protocol.HistoryEntry {
-	entry.Image = cloneImage(entry.Image)
-	return entry
-}
-
-func cloneImage(image *protocol.Image) *protocol.Image {
-	if image == nil {
-		return nil
-	}
-	cloned := *image
-	cloned.Data = append([]byte(nil), image.Data...)
-	return &cloned
 }

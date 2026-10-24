@@ -2,6 +2,8 @@ package history
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"image"
 	"image/color"
@@ -15,6 +17,16 @@ import (
 
 	"github.com/Nomadcxx/sysc-notify/protocol"
 )
+
+// imageDigest names the sidecar of an image the way the store does.
+func imageDigest(t *testing.T, source *protocol.Image) string {
+	t.Helper()
+	if source == nil {
+		t.Fatal("no image")
+	}
+	digest := sha256.Sum256(source.Data)
+	return hex.EncodeToString(digest[:])
+}
 
 func TestStorePersistsVersionedHistory(t *testing.T) {
 	stateHome := t.TempDir()
@@ -266,8 +278,8 @@ func TestCorruptImageSidecarDoesNotQuarantineHistory(t *testing.T) {
 	if err := store.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	reference := imageReference(addedDamaged.Image)
-	sidecar := filepath.Join(stateHome, "sysc-notify", "images", reference.SHA256+".png")
+	reference := imageDigest(t, addedDamaged.Image)
+	sidecar := filepath.Join(stateHome, "sysc-notify", "images", reference+".png")
 	if err := os.Truncate(sidecar, 4); err != nil {
 		t.Fatal(err)
 	}
