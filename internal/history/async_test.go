@@ -106,6 +106,13 @@ func TestSuccessfulCommitClearsRememberedError(t *testing.T) {
 // the whole history (the per-mutation clone that ran on the owner goroutine).
 // The worker snapshots once when it wakes, so a scheduling mutation must not
 // allocate a pending copy.
+//
+// The dirty flag is transient: the persistence worker clears it the moment it
+// commits, so reading it straight after Add raced that commit and failed on a
+// loaded runner (sysc-1747). The test reads settled state instead. The write
+// generation counts scheduled writes, is monotonic and is never reset, so it
+// says how many were scheduled without a race; Flush and the committed file
+// say the scheduled write reached disk.
 func TestScheduleDoesNotCopyEntries(t *testing.T) {
 	stateHome := t.TempDir()
 	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
@@ -118,18 +125,69 @@ func TestScheduleDoesNotCopyEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, err := store.Add(testEntry(1, now), now); err != nil {
+	entry := testEntry(1, now)
+	entry.Image = testPNG(t, 192, 96)
+
+	before := store.writeGeneration()
+	if _, _, err := store.Add(entry, now); err != nil {
 		t.Fatal(err)
 	}
-	store.mu.Lock()
-	dirty := store.dirty
-	store.mu.Unlock()
-	if !dirty {
-		t.Fatal("Add did not mark the store dirty")
+	if got := store.writeGeneration(); got != before+1 {
+		t.Fatalf("write generation after Add = %d, want %d", got, before+1)
 	}
+	first := storedImageBytes(store, 1)
+	if len(first) == 0 {
+		t.Fatal("the store holds no image for the added entry")
+	}
+
+	// A second mutation must not copy what the first one left behind: the
+	// retained entries share their image bytes, so the bytes of an entry that
+	// was already there are the same bytes afterwards.
+	second := testEntry(2, now)
+	second.Image = testPNG(t, 64, 32)
+	before = store.writeGeneration()
+	if _, _, err := store.Add(second, now); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.writeGeneration(); got != before+1 {
+		t.Fatalf("write generation after the second Add = %d, want %d", got, before+1)
+	}
+	if again := storedImageBytes(store, 1); len(again) == 0 || &again[0] != &first[0] {
+		t.Fatal("a mutation copied the image bytes of an entry it already held")
+	}
+
 	if err := store.Flush(); err != nil {
 		t.Fatal(err)
 	}
+	reopened, err := OpenAt(stateHome, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	if got := reopened.Entries(); len(got) != 2 {
+		t.Fatalf("committed entries = %d, want 2", len(got))
+	}
+}
+
+// writeGeneration reports how many writes have been scheduled. It is
+// monotonic and is never reset, so a test can read it without racing the
+// persistence worker.
+func (s *Store) writeGeneration() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.writeGen
+}
+
+// storedImageBytes returns the image bytes the store holds for one entry.
+func storedImageBytes(s *Store, id uint32) []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range s.entries {
+		if e.entry.ID == id && e.entry.Image != nil {
+			return e.entry.Image.Data
+		}
+	}
+	return nil
 }
 
 // TestConcurrentMutationsFlush is a race probe: mutations must be safe to
