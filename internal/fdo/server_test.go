@@ -76,8 +76,13 @@ func TestServerMetadataAndNotifyReplacement(t *testing.T) {
 	if err := h.object.Call(Interface+".GetCapabilities", 0).Store(&capabilities); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(capabilities, []string{"actions", "body", "body-markup", "icon-static", "inline-reply", "persistence"}) {
-		t.Fatalf("capabilities = %v, want [actions body body-markup icon-static inline-reply persistence]", capabilities)
+	for _, want := range []string{"actions", "body", "body-images", "body-markup", "icon-static", "inline-reply", "persistence"} {
+		if !containsCapability(capabilities, want) {
+			t.Fatalf("capabilities = %v, missing %q", capabilities, want)
+		}
+	}
+	if containsCapability(capabilities, "icon-multi") && containsCapability(capabilities, "icon-static") {
+		t.Fatalf("capabilities = %v advertise both icon-multi and icon-static, which the spec forbids", capabilities)
 	}
 
 	first := sendNotify(t, h.object, 0, "first", nil, -1)
@@ -390,6 +395,16 @@ func writeProcessStat(t *testing.T, root string, pid, parent uint32, start uint6
 	if err := os.WriteFile(filepath.Join(dir, "stat"), []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// containsCapability reports whether the advertised list carries want.
+func containsCapability(capabilities []string, want string) bool {
+	for _, capability := range capabilities {
+		if capability == want {
+			return true
+		}
+	}
+	return false
 }
 
 func sendNotify(t *testing.T, object dbus.BusObject, replacesID uint32, summary string, hints map[string]dbus.Variant, timeout int32) uint32 {
