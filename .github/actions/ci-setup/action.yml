@@ -1,0 +1,10 @@
+name: CI setup
+
+description: Install the native test dependency required by sysc-notify.
+
+runs:
+  using: composite
+  steps:
+    - name: Install D-Bus for integration tests
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y dbus
