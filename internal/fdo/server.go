@@ -243,8 +243,37 @@ func nameOwnerMatch() []dbus.MatchOption {
 	}
 }
 
+// capabilities is the list GetCapabilities returns. Every entry is a claim a
+// sender may gate a feature on, so it is declared once here rather than as an
+// inline literal, and each entry names the test that keeps it honest.
+//
+//	"actions"      ActionInvoked is emitted from state.Owner's action path.
+//	"body"         the presenter renders Summary and Body.
+//	"body-images"  TestServerConvertsImageDataOverDBus proves image-data
+//	               decodes into the snapshot, and applyImageHints applies the
+//	               spec's image-data > image-path > icon_data precedence.
+//	               Advertised since sysc-745: senders that gate on this string
+//	               never attached an image, though it rendered correctly.
+//	"body-markup"  the presenter parses the markup subset.
+//	"icon-static"  one frame of a given image array is rendered.
+//	"inline-reply" the inline-reply hint and NotificationReplied are wired.
+//	"persistence"  notifications survive until dismissed or replaced.
+//
+// "icon-multi" is deliberately absent: the presenter renders a single frame,
+// and the spec makes advertising it together with "icon-static" an error.
+// "sound" is absent because nothing opens a sound-file.
+var capabilities = []string{
+	"actions",
+	"body",
+	"body-images",
+	"body-markup",
+	"icon-static",
+	"inline-reply",
+	"persistence",
+}
+
 func (e endpoint) GetCapabilities() ([]string, *dbus.Error) {
-	return []string{"actions", "body", "body-markup", "icon-static", "inline-reply", "persistence"}, nil
+	return append([]string(nil), capabilities...), nil
 }
 
 func (e endpoint) GetServerInformation() (string, string, string, string, *dbus.Error) {
