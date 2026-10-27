@@ -22,7 +22,7 @@ const (
 	Interface     = BusName
 	ServerName    = "sysc-notify"
 	ServerVendor  = "Nomadcxx"
-	ServerVersion = "0.1.0"
+	ServerVersion = "0.1.2"
 	SpecVersion   = "1.3"
 
 	dbusInvalidArgs     = "org.freedesktop.DBus.Error.InvalidArgs"
