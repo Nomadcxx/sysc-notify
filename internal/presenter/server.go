@@ -3,12 +3,14 @@ package presenter
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -563,33 +565,139 @@ func hasCapability(capabilities []string, required string) bool {
 // record may carry a wire image, and together they can outgrow one frame, so
 // images are dropped oldest first, active before history, until it fits. The
 // records still arrive; the shell shows those without their image.
+//
+// The frame is marshalled once. Dropping an image used to re-marshal the
+// whole snapshot, so a snapshot that only fits without its images cost three
+// passes over the payload. The cost of an image follows from its bytes, so
+// the images that fit are chosen before the single marshal.
 func marshalSnapshot(snapshot protocol.Snapshot) ([]byte, error) {
-	frame, err := marshalEnvelope(protocol.KindSnapshot, 0, snapshot.Sequence, snapshot)
-	if err != nil || len(frame) <= int(protocol.MaxFrameSize) {
-		return frame, err
+	return marshalSnapshotWithin(snapshot, int(protocol.MaxFrameSize))
+}
+
+// marshalSnapshotWithin frames the handshake snapshot within the given limit.
+func marshalSnapshotWithin(snapshot protocol.Snapshot, limit int) ([]byte, error) {
+	return marshalSnapshotWithinCost(snapshot, limit, wireImageCost)
+}
+
+// marshalSnapshotWithinCost frames the handshake snapshot within the given
+// limit, pricing the images with the given cost function. The cost function
+// is a parameter so the backstop can be exercised: a model that under-prices
+// an image has to still produce a frame inside the limit.
+func marshalSnapshotWithinCost(snapshot protocol.Snapshot, limit int, cost func(*protocol.Image) int) ([]byte, error) {
+	// The records are copied before the images are removed: the snapshot the
+	// caller owns must keep its images.
+	bodies := snapshot
+	bodies.Active = append([]protocol.Notification(nil), snapshot.Active...)
+	bodies.History = append([]protocol.HistoryEntry(nil), snapshot.History...)
+	for i := range bodies.Active {
+		bodies.Active[i].Image = nil
 	}
-	images := make([]**protocol.Image, 0, len(snapshot.Active)+len(snapshot.History))
+	for i := range bodies.History {
+		bodies.History[i].Image = nil
+	}
+	base, err := marshalEnvelope(protocol.KindSnapshot, 0, snapshot.Sequence, bodies)
+	if err != nil {
+		return nil, err
+	}
+	if len(base) > limit {
+		return nil, errors.New("presenter: snapshot exceeds frame size without images")
+	}
+	images := make([]wireImage, 0, len(snapshot.Active)+len(snapshot.History))
 	for i := range snapshot.Active {
 		if snapshot.Active[i].Image != nil {
-			images = append(images, &snapshot.Active[i].Image)
+			images = append(images, wireImage{image: snapshot.Active[i].Image, active: i, history: -1})
 		}
 	}
 	for i := range snapshot.History {
 		if snapshot.History[i].Image != nil {
-			images = append(images, &snapshot.History[i].Image)
+			images = append(images, wireImage{image: snapshot.History[i].Image, active: -1, history: i})
 		}
 	}
-	for len(frame) > int(protocol.MaxFrameSize) && len(images) > 0 {
-		for excess := len(frame) - int(protocol.MaxFrameSize); excess > 0 && len(images) > 0; images = images[1:] {
-			excess -= base64.StdEncoding.EncodedLen(len((*images[0]).Data))
-			*images[0] = nil
+	// The newest images are kept: the list is walked from the end and the
+	// first image that does not fit ends the run, so the images that are
+	// dropped are the oldest ones.
+	budget := limit - len(base)
+	kept := make([]wireImage, 0, len(images))
+	for i := len(images) - 1; i >= 0; i-- {
+		price := cost(images[i].image)
+		if price > budget {
+			break
 		}
-		if frame, err = marshalEnvelope(protocol.KindSnapshot, 0, snapshot.Sequence, snapshot); err != nil {
+		budget -= price
+		kept = append(kept, images[i])
+	}
+	// The images were taken from the end of the list, so the kept slice runs
+	// newest first. Turning it around puts the oldest first, which is the
+	// one the backstop below gives up.
+	for i, j := 0, len(kept)-1; i < j; i, j = i+1, j-1 {
+		kept[i], kept[j] = kept[j], kept[i]
+	}
+	for _, image := range kept {
+		if image.active >= 0 {
+			bodies.Active[image.active].Image = image.image
+		} else {
+			bodies.History[image.history].Image = image.image
+		}
+	}
+	frame, err := marshalEnvelope(protocol.KindSnapshot, 0, snapshot.Sequence, bodies)
+	if err != nil {
+		return nil, err
+	}
+	// The cost model is exact, so the frame fits by construction. The loop
+	// is the backstop: a frame that went over anyway gives up its oldest
+	// image and is written again, the way the framing behaved before the
+	// cost model existed. A handshake that cannot hold the snapshot is a
+	// worse outcome than a snapshot without one image.
+	for len(frame) > limit && len(kept) > 0 {
+		oldest := kept[0]
+		kept = kept[1:]
+		if oldest.active >= 0 {
+			bodies.Active[oldest.active].Image = nil
+		} else {
+			bodies.History[oldest.history].Image = nil
+		}
+		if frame, err = marshalEnvelope(protocol.KindSnapshot, 0, snapshot.Sequence, bodies); err != nil {
 			return nil, err
 		}
 	}
-	if len(frame) > int(protocol.MaxFrameSize) {
+	if len(frame) > limit {
 		return nil, errors.New("presenter: snapshot exceeds frame size without images")
 	}
 	return frame, nil
+}
+
+// wireImage is one image in a snapshot and the record that carries it.
+type wireImage struct {
+	image   *protocol.Image
+	active  int
+	history int
+}
+
+// wireImageCost is the number of bytes an image adds to a marshalled frame:
+// the base64 payload and the JSON object around it. The object is measured
+// from the field names and the escaped media type, so the budget matches the
+// frame that is written.
+func wireImageCost(image *protocol.Image) int {
+	// The object is what the image field adds to its record: the separating
+	// comma, the key, and the punctuation of the object itself. The media
+	// type, the two dimensions and the payload are counted on top of it.
+	// The comma belongs in the constant: the image field sits between other
+	// fields, so the frame writes a separator before it, and an estimate
+	// that left the separator out was a byte short for every image.
+	const objectOverhead = len(`,"image":{"media_type":"","width":,"height":,"data":""}`)
+	cost := objectOverhead + escapedJSONLen(image.MediaType)
+	cost += len(strconv.FormatUint(uint64(image.Width), 10))
+	cost += len(strconv.FormatUint(uint64(image.Height), 10))
+	return cost + base64.StdEncoding.EncodedLen(len(image.Data))
+}
+
+// escapedJSONLen is the length of s once encoding/json has escaped it. The
+// media type is the only free-form string in an image, and one that needs
+// escaping would otherwise make the frame larger than the budget.
+func escapedJSONLen(s string) int {
+	raw, err := json.Marshal(s)
+	if err != nil {
+		return 6 * len(s)
+	}
+	return len(raw) - 2
 }

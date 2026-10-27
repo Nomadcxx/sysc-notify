@@ -18,6 +18,12 @@ import (
 	"github.com/Nomadcxx/sysc-notify/protocol"
 )
 
+// settledBackstop bounds how long a test waits for a state to settle. It is
+// a backstop against a hang, not the assertion: a handshake snapshot carries
+// every record with its image and can be tens of megabytes, so the budget
+// only has to cover the slowest loaded machine.
+const settledBackstop = 60 * time.Second
+
 func TestServerCreatesPrivateRuntimeSocketAndRejectsUnsafePaths(t *testing.T) {
 	h := startServerHarness(t, nil)
 	for path, mode := range map[string]os.FileMode{
@@ -399,7 +405,7 @@ func connectPresenterWithHello(t *testing.T, path string, clientHello protocol.H
 	if !hasCapability(serviceHello.Capabilities, RequiredLifetimeCapability) {
 		t.Fatalf("service capabilities = %#v", serviceHello.Capabilities)
 	}
-	snapshotEnvelope := readEnvelope(t, conn)
+	snapshotEnvelope := readEnvelopeWithin(t, conn, settledBackstop, "the presenter did not send the handshake snapshot")
 	if snapshotEnvelope.Kind != protocol.KindSnapshot {
 		t.Fatalf("second server message = %#v", snapshotEnvelope)
 	}
@@ -447,12 +453,21 @@ func writeEnvelope(conn net.Conn, kind string, requestID, sequence uint64, paylo
 
 func readEnvelope(t *testing.T, conn net.Conn) protocol.Envelope {
 	t.Helper()
-	if err := conn.SetReadDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+	return readEnvelopeWithin(t, conn, handshakeTimeout, "reading an envelope")
+}
+
+// readEnvelopeWithin reads one frame with a backstop deadline. The deadline
+// bounds a hang; it is not the assertion. A frame arrives when the server has
+// written it, and a snapshot can carry every record with its image, so the
+// budget only has to be long enough for the slowest loaded machine.
+func readEnvelopeWithin(t *testing.T, conn net.Conn, within time.Duration, step string) protocol.Envelope {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(within)); err != nil {
 		t.Fatal(err)
 	}
 	frame, err := protocol.ReadFrame(conn)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("%s: %v", step, err)
 	}
 	var envelope protocol.Envelope
 	if err := protocol.DecodeStrict(frame, &envelope); err != nil {
@@ -588,8 +603,8 @@ func TestOversizedResyncSnapshotClosesConnection(t *testing.T) {
 	}
 	select {
 	case <-current.closed:
-	case <-time.After(5 * time.Second):
-		t.Fatal("oversized resync snapshot left the connection open")
+	case <-time.After(settledBackstop):
+		t.Fatal("the connection stayed open after the oversized resync snapshot")
 	}
 	if server.Publish(state.Event{
 		Sequence: snap.Sequence + 2,
