@@ -24,6 +24,9 @@ const (
 	// document to grow by a few bytes (seen flags) after the last Add, so the
 	// daemon never writes a file its own read path would reject.
 	maxHistoryWriteBytes = maxHistoryJSONBytes - 256
+	// persistRetryDelay is how long the worker waits before it tries again
+	// after a failed commit, so a disk that stays full does not spin it.
+	persistRetryDelay = 250 * time.Millisecond
 )
 
 // errFileTooLarge marks a committed file that exceeds the read limit. Unlike
@@ -222,17 +225,32 @@ func (s *Store) persistLoop() {
 			gen := s.writeGen
 			s.dirty = false
 			s.mu.Unlock()
-			if err := s.commit(target); err != nil {
+			err := s.commit(target)
+			if err != nil {
 				s.recordErr(err)
 			} else {
 				s.clearErr()
 			}
 			s.mu.Lock()
+			if err != nil {
+				// The snapshot did not reach the disk. Keep the store dirty
+				// so that the next attempt and Close both write it; a failed
+				// attempt is not a durable one.
+				s.dirty = true
+			}
 			if gen > s.workerGen {
 				s.workerGen = gen
 			}
 			s.cond.Broadcast()
 			s.mu.Unlock()
+			if err != nil {
+				// Wait before the next attempt, so a disk that stays full does
+				// not spin the worker.
+				select {
+				case <-s.closing:
+				case <-time.After(persistRetryDelay):
+				}
+			}
 			continue
 		}
 		s.mu.Unlock()
@@ -297,14 +315,19 @@ func (s *Store) Close() error {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
 		s.closed = true
+		s.mu.Unlock()
+		close(s.closing)
+		<-s.workerDone
+		// Read what is pending once the worker has stopped: a commit that was
+		// in flight when the close began may have failed, and that failure
+		// leaves the snapshot dirty for this last write.
+		s.mu.Lock()
 		dirty := s.dirty
 		var target []retained
 		if dirty {
 			target = cloneRetained(s.entries)
 		}
 		s.mu.Unlock()
-		close(s.closing)
-		<-s.workerDone
 		if dirty {
 			if err := s.commit(target); err != nil {
 				s.recordErr(err)
