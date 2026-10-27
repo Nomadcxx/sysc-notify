@@ -138,6 +138,97 @@ func TestMarshalSnapshotUsesTheProtocolFrameLimit(t *testing.T) {
 	}
 }
 
+// The cost model decides which images fit, so it has to be the size of the
+// image as the frame carries it. Measured against the frame, the model
+// cannot be a byte short: a short estimate keeps one image too many, the
+// frame goes over the limit, and a handshake fails where a snapshot without
+// one image would have done.
+func TestWireImageCostMatchesTheFrameItIsAddedTo(t *testing.T) {
+	image := &protocol.Image{MediaType: "image/png", Width: 100, Height: 100, Data: []byte("ABCD")}
+	withImage := protocol.Snapshot{Sequence: 1, Active: []protocol.Notification{
+		{ID: 1, Summary: "one", Image: image},
+	}}
+	withoutImage := protocol.Snapshot{Sequence: 1, Active: []protocol.Notification{
+		{ID: 1, Summary: "one"},
+	}}
+	with, err := marshalEnvelope(protocol.KindSnapshot, 0, withImage.Sequence, withImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	without, err := marshalEnvelope(protocol.KindSnapshot, 0, withoutImage.Sequence, withoutImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta := len(with) - len(without)
+	if got := wireImageCost(image); got != delta {
+		t.Fatalf("wireImageCost = %d, the image adds %d bytes to the frame", got, delta)
+	}
+}
+
+// The limit the framing is given is the size of the bodies plus what the
+// images cost, so every image fits exactly. The frame that comes out has to
+// be within the limit: the cost model is what the framing decides with, so a
+// frame bigger than the model allows cannot be written.
+func TestMarshalSnapshotHonoursALimitBuiltFromTheCostModel(t *testing.T) {
+	const images = 12
+	snapshot := snapshotWithImages(0, images, 16)
+	bodies := snapshot
+	bodies.History = append([]protocol.HistoryEntry(nil), snapshot.History...)
+	for i := range bodies.History {
+		bodies.History[i].Image = nil
+	}
+	base, err := marshalEnvelope(protocol.KindSnapshot, 0, snapshot.Sequence, bodies)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limit := len(base) + images*wireImageCost(snapshot.History[0].Image)
+	frame, err := marshalSnapshotWithin(snapshot, limit)
+	if err != nil {
+		t.Fatalf("marshalSnapshotWithin refused a snapshot that fits the limit: %v", err)
+	}
+	if len(frame) > limit {
+		t.Fatalf("frame is %d bytes, over the %d byte limit", len(frame), limit)
+	}
+}
+
+// A cost model that under-prices an image keeps one image too many. The
+// frame has to come out inside the limit anyway: the snapshot is worth less
+// than the handshake that carries it.
+func TestMarshalSnapshotDropsAnImageWhenTheCostModelIsShort(t *testing.T) {
+	const images = 4
+	snapshot := snapshotWithImages(0, images, 16)
+	bodies := snapshot
+	bodies.History = append([]protocol.HistoryEntry(nil), snapshot.History...)
+	for i := range bodies.History {
+		bodies.History[i].Image = nil
+	}
+	base, err := marshalEnvelope(protocol.KindSnapshot, 0, snapshot.Sequence, bodies)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The limit leaves room for the images as they are, and the model
+	// prices every one of them a byte short, so it keeps one too many.
+	limit := len(base) + images*(wireImageCost(snapshot.History[0].Image)-1)
+	short := func(image *protocol.Image) int { return wireImageCost(image) - 1 }
+	frame, err := marshalSnapshotWithinCost(snapshot, limit, short)
+	if err != nil {
+		t.Fatalf("marshalSnapshotWithinCost refused a snapshot that fits the limit: %v", err)
+	}
+	if len(frame) > limit {
+		t.Fatalf("frame is %d bytes, over the %d byte limit", len(frame), limit)
+	}
+	decoded := decodeSnapshotFrame(t, frame)
+	kept := 0
+	for _, id := range recordIDs(decoded) {
+		if hasImage(decoded, id) {
+			kept++
+		}
+	}
+	if kept != images-1 {
+		t.Fatalf("the frame holds %d images, want %d: the backstop did not give one up", kept, images-1)
+	}
+}
+
 func hasImage(snapshot protocol.Snapshot, id uint32) bool {
 	for _, notification := range snapshot.Active {
 		if notification.ID == id {
