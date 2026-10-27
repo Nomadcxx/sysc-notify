@@ -3,12 +3,14 @@ package presenter
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -563,33 +565,102 @@ func hasCapability(capabilities []string, required string) bool {
 // record may carry a wire image, and together they can outgrow one frame, so
 // images are dropped oldest first, active before history, until it fits. The
 // records still arrive; the shell shows those without their image.
+//
+// The frame is marshalled once. Dropping an image used to re-marshal the
+// whole snapshot, so a snapshot that only fits without its images cost three
+// passes over the payload. The cost of an image follows from its bytes, so
+// the images that fit are chosen before the single marshal.
 func marshalSnapshot(snapshot protocol.Snapshot) ([]byte, error) {
-	frame, err := marshalEnvelope(protocol.KindSnapshot, 0, snapshot.Sequence, snapshot)
-	if err != nil || len(frame) <= int(protocol.MaxFrameSize) {
-		return frame, err
+	return marshalSnapshotWithin(snapshot, int(protocol.MaxFrameSize))
+}
+
+// marshalSnapshotWithin frames the handshake snapshot within the given limit.
+func marshalSnapshotWithin(snapshot protocol.Snapshot, limit int) ([]byte, error) {
+	// The records are copied before the images are removed: the snapshot the
+	// caller owns must keep its images.
+	bodies := snapshot
+	bodies.Active = append([]protocol.Notification(nil), snapshot.Active...)
+	bodies.History = append([]protocol.HistoryEntry(nil), snapshot.History...)
+	for i := range bodies.Active {
+		bodies.Active[i].Image = nil
 	}
-	images := make([]**protocol.Image, 0, len(snapshot.Active)+len(snapshot.History))
+	for i := range bodies.History {
+		bodies.History[i].Image = nil
+	}
+	base, err := marshalEnvelope(protocol.KindSnapshot, 0, snapshot.Sequence, bodies)
+	if err != nil {
+		return nil, err
+	}
+	if len(base) > limit {
+		return nil, errors.New("presenter: snapshot exceeds frame size without images")
+	}
+	images := make([]wireImage, 0, len(snapshot.Active)+len(snapshot.History))
 	for i := range snapshot.Active {
 		if snapshot.Active[i].Image != nil {
-			images = append(images, &snapshot.Active[i].Image)
+			images = append(images, wireImage{image: snapshot.Active[i].Image, active: i, history: -1})
 		}
 	}
 	for i := range snapshot.History {
 		if snapshot.History[i].Image != nil {
-			images = append(images, &snapshot.History[i].Image)
+			images = append(images, wireImage{image: snapshot.History[i].Image, active: -1, history: i})
 		}
 	}
-	for len(frame) > int(protocol.MaxFrameSize) && len(images) > 0 {
-		for excess := len(frame) - int(protocol.MaxFrameSize); excess > 0 && len(images) > 0; images = images[1:] {
-			excess -= base64.StdEncoding.EncodedLen(len((*images[0]).Data))
-			*images[0] = nil
+	// The newest images are kept: the list is walked from the end and the
+	// first image that does not fit ends the run, so the images that are
+	// dropped are the oldest ones.
+	budget := limit - len(base)
+	kept := make([]wireImage, 0, len(images))
+	for i := len(images) - 1; i >= 0; i-- {
+		cost := wireImageCost(images[i].image)
+		if cost > budget {
+			break
 		}
-		if frame, err = marshalEnvelope(protocol.KindSnapshot, 0, snapshot.Sequence, snapshot); err != nil {
-			return nil, err
+		budget -= cost
+		kept = append(kept, images[i])
+	}
+	for _, image := range kept {
+		if image.active >= 0 {
+			bodies.Active[image.active].Image = image.image
+		} else {
+			bodies.History[image.history].Image = image.image
 		}
 	}
-	if len(frame) > int(protocol.MaxFrameSize) {
+	frame, err := marshalEnvelope(protocol.KindSnapshot, 0, snapshot.Sequence, bodies)
+	if err != nil {
+		return nil, err
+	}
+	if len(frame) > limit {
 		return nil, errors.New("presenter: snapshot exceeds frame size without images")
 	}
 	return frame, nil
+}
+
+// wireImage is one image in a snapshot and the record that carries it.
+type wireImage struct {
+	image   *protocol.Image
+	active  int
+	history int
+}
+
+// wireImageCost is the number of bytes an image adds to a marshalled frame:
+// the base64 payload and the JSON object around it. The object is measured
+// from the field names and the escaped media type, so the budget matches the
+// frame that is written.
+func wireImageCost(image *protocol.Image) int {
+	const objectOverhead = len(`"image":{"media_type":"","width":,"height":,"data":""}`)
+	cost := objectOverhead + escapedJSONLen(image.MediaType)
+	cost += len(strconv.FormatUint(uint64(image.Width), 10))
+	cost += len(strconv.FormatUint(uint64(image.Height), 10))
+	return cost + base64.StdEncoding.EncodedLen(len(image.Data))
+}
+
+// escapedJSONLen is the length of s once encoding/json has escaped it. The
+// media type is the only free-form string in an image, and one that needs
+// escaping would otherwise make the frame larger than the budget.
+func escapedJSONLen(s string) int {
+	raw, err := json.Marshal(s)
+	if err != nil {
+		return 6 * len(s)
+	}
+	return len(raw) - 2
 }
