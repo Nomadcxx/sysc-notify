@@ -53,6 +53,13 @@ This repository has no release workflow yet, so it has no release notes. The rul
 Check the machine first: `uptime`, and look for processes an earlier run left behind. A goroutine dump
 is the second tool, not the first.
 
+## Settled-state checks
+
+A test asserts on a settled state, not on a guess about when the work will be done. When the work is
+done by another goroutine, wait for that goroutine. When the test genuinely needs time to pass, use
+`testing/synctest`, which owns the clock and keeps the assertion on the virtual timeline. A deadline
+is a backstop, never the assertion, and an expired wait has to name the step that did not settle.
+
 ## Check the tree you are changing
 
 Confirm a constraint against `git show origin/main:AGENTS.md` before acting on it when the
