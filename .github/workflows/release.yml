@@ -1,0 +1,169 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # A manual run rehearses the gate for a tag without publishing anything:
+  # gh workflow run release.yml --ref v0.1.1
+  workflow_dispatch:
+
+# A release must never be cancelled mid-flight, so superseded runs queue.
+# The suffix names the workflow file rather than the run: a called workflow
+# sees the caller's workflow name, so the checks this run calls need groups
+# of their own or they would cancel this run.
+concurrency:
+  group: ${{ github.workflow }}-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # The gate proves three things before anything is published: the tag has the
+  # shape this project publishes, it points at a commit that reached the
+  # default branch, and that commit passes the same checks the branch
+  # protection requires. Nothing is published until the gate passes.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      commit: ${{ steps.tag.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The whole history and every tag: the ancestry check needs the
+          # merge that carried the tagged commit onto the default branch.
+          fetch-depth: 0
+      - name: Parse tag
+        id: tag
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?)$ ]]; then
+            echo "tag '$tag' is not v<major>.<minor>.<patch> or v<major>.<minor>.<patch>-rc.<n>" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          # Fetch the tag itself. The checkout does not follow tags unless the
+          # run was triggered by one, and the commit under the tag is what the
+          # gate has to reason about.
+          git fetch --no-tags --force origin "refs/tags/$tag:refs/tags/$tag"
+          echo "commit=$(git rev-list -n1 "$tag")" >> "$GITHUB_OUTPUT"
+      - name: Verify the tagged commit reached the default branch
+        run: |
+          set -euo pipefail
+          commit="${{ steps.tag.outputs.commit }}"
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          if ! git merge-base --is-ancestor "$commit" origin/main; then
+            echo "tag ${{ steps.tag.outputs.tag }} points at $commit, which never reached main" >&2
+            exit 1
+          fi
+
+  # The checks the branch protection requires, re-run against the tagged
+  # commit. Calling the workflows the branch already trusts keeps one test
+  # policy: a check added to ci.yml reaches the release gate without a second
+  # edit here. A called run is pinned to the tag, so it tests the tree that
+  # ships.
+  checks:
+    needs: gate
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  scan:
+    needs: gate
+    uses: ./.github/workflows/vuln.yml
+    permissions:
+      contents: read
+
+  # Builds the binary from the tagged commit and proves the binary carries
+  # that commit. The stamp comes from the build itself, so it cannot be
+  # forged by the workflow that runs the build.
+  build:
+    needs: [gate, checks, scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The whole history: the build stamps the revision it was built
+          # from, and the stamp is only written when the tree is a checkout.
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o dist/sysc-notify ./cmd/sysc-notify
+      - name: Verify the binary carries the tagged commit
+        env:
+          COMMIT: ${{ needs.gate.outputs.commit }}
+        run: |
+          set -euo pipefail
+          info="$(go version -m dist/sysc-notify)"
+          revision="$(printf '%s\n' "$info" | sed -n 's/^[[:space:]]*build[[:space:]]*vcs\.revision=//p')"
+          modified="$(printf '%s\n' "$info" | sed -n 's/^[[:space:]]*build[[:space:]]*vcs\.modified=//p')"
+          if [ -z "$revision" ]; then
+            echo "the binary carries no build revision, so it did not come from a checkout" >&2
+            exit 1
+          fi
+          if [ "$revision" != "$COMMIT" ]; then
+            echo "the binary was built from $revision, not from the tagged commit $COMMIT" >&2
+            exit 1
+          fi
+          if [ "$modified" != "false" ]; then
+            echo "the binary was built from a modified tree" >&2
+            exit 1
+          fi
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum sysc-notify > SHA256SUMS
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/sysc-notify
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-amd64
+          path: dist/*
+          if-no-files-found: error
+
+  # Publishes the release once the gate and the build passed. A manual run
+  # stops here: only a tag push publishes.
+  release:
+    needs: [gate, checks, scan, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.gate.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # Re-running a finished release re-uploads the assets instead of
+            # failing on the release that already exists.
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --title "sysc-notify $tag" \
+              --generate-notes \
+              --verify-tag
+          fi

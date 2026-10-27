@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The release workflow calls this one to re-run the same checks against the
+  # tagged commit. A called run is pinned to the tag, so the tree under test
+  # is the tree that ships.
+  workflow_call:
 
 permissions:
   contents: read
