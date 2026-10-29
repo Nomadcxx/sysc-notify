@@ -14,9 +14,10 @@ import (
 )
 
 const (
-	DefaultTimeout    = 5 * time.Second
-	PresentationLease = 6 * time.Second
-	HistorySweep      = time.Minute
+	DefaultTimeout          = 5 * time.Second
+	PresentationLease       = 6 * time.Second
+	HistorySweep            = time.Minute
+	notificationBurstWindow = 5 * time.Second
 )
 
 var (
@@ -242,6 +243,7 @@ type record struct {
 	remaining    time.Duration
 	deadline     time.Time
 	hasDeadline  bool
+	lastReceived time.Time
 }
 
 type ownerState struct {
@@ -354,7 +356,37 @@ func (s *ownerState) requirePresenter(generation uint64) error {
 }
 
 func (s *ownerState) add(candidate notify.Candidate, prepared *history.PreparedImage, now time.Time) (Result, error) {
+	if candidate.ReplacesID == 0 {
+		candidate.ReplacesID = s.burstDuplicate(candidate, now)
+	}
 	return s.addWithProducerKey(candidate, "", prepared, now)
+}
+
+// burstDuplicate finds the most recently received matching active notification.
+// Explicit replacements and producer notifications keep their existing identity rules.
+func (s *ownerState) burstDuplicate(candidate notify.Candidate, now time.Time) uint32 {
+	var duplicate *record
+	for i := len(s.order) - 1; i >= 0; i-- {
+		existing := s.records[s.order[i]]
+		if existing == nil || existing.producerKey != "" || !sameBurstKey(existing.candidate, candidate) {
+			continue
+		}
+		age := now.Sub(existing.lastReceived)
+		if age < 0 || age > notificationBurstWindow {
+			continue
+		}
+		if duplicate == nil || existing.lastReceived.After(duplicate.lastReceived) {
+			duplicate = existing
+		}
+	}
+	if duplicate == nil {
+		return 0
+	}
+	return duplicate.notification.ID
+}
+
+func sameBurstKey(a, b notify.Candidate) bool {
+	return a.AppName == b.AppName && a.Summary == b.Summary && a.Body == b.Body && a.Urgency == b.Urgency
 }
 
 func (s *ownerState) addWithProducerKey(candidate notify.Candidate, producerKey string, prepared *history.PreparedImage, now time.Time) (Result, error) {
@@ -380,6 +412,7 @@ func (s *ownerState) addWithProducerKey(candidate notify.Candidate, producerKey 
 		duration:     duration,
 		state:        protocol.PresentationSuppressed,
 		remaining:    duration,
+		lastReceived: now,
 	}
 	if replaced {
 		if existing.producerKey != "" && existing.producerKey != producerKey && s.producerIDs[existing.producerKey] == id {

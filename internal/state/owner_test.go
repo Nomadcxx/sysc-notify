@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -42,6 +43,76 @@ func TestOwnerSequencesAddAndReplacement(t *testing.T) {
 	snapshot := snapshot(t, owner)
 	if len(snapshot.Active) != 1 || snapshot.Active[0].Summary != "replacement" || len(snapshot.History) != 0 {
 		t.Fatalf("snapshot = %#v", snapshot)
+	}
+}
+
+func TestOwnerDeduplicatesBurstNotificationsAndRestartsExpiry(t *testing.T) {
+	clock, owner := startClockOwner(t)
+	baseCandidate := candidate("same summary", 10*time.Second)
+	baseCandidate.AppName = "test app"
+	baseCandidate.Body = "same body"
+
+	first := do(t, owner, Command{Kind: Add, Candidate: baseCandidate})
+	clock.Advance(4 * time.Second)
+	duplicate := do(t, owner, Command{Kind: Add, Candidate: baseCandidate})
+	if duplicate.ID != first.ID || !duplicate.Replaced {
+		t.Fatalf("duplicate result = %#v, first = %#v", duplicate, first)
+	}
+	if active := snapshot(t, owner).Active; len(active) != 1 || active[0].ID != first.ID {
+		t.Fatalf("active after duplicate = %#v", active)
+	}
+	clock.Advance(4 * time.Second)
+	duplicate = do(t, owner, Command{Kind: Add, Candidate: baseCandidate})
+	if duplicate.ID != first.ID || !duplicate.Replaced {
+		t.Fatalf("second duplicate result = %#v, first = %#v", duplicate, first)
+	}
+
+	// The original deadline is t=10s; the second duplicate moves it to t=18s.
+	clock.Advance(3 * time.Second)
+	if !hasID(snapshot(t, owner), first.ID) {
+		t.Fatal("duplicate did not restart the notification timer")
+	}
+	clock.Advance(7 * time.Second)
+	if hasID(snapshot(t, owner), first.ID) {
+		t.Fatal("notification remained active after the restarted timer")
+	}
+}
+
+func TestOwnerDeduplicationUsesFiveSecondWindowAndKey(t *testing.T) {
+	clock, owner := startClockOwner(t)
+	baseCandidate := candidate("summary", time.Minute)
+	baseCandidate.AppName = "app"
+	baseCandidate.Body = "body"
+	first := do(t, owner, Command{Kind: Add, Candidate: baseCandidate})
+
+	clock.Advance(notificationBurstWindow)
+	boundary := do(t, owner, Command{Kind: Add, Candidate: baseCandidate})
+	if boundary.ID != first.ID || !boundary.Replaced {
+		t.Fatalf("duplicate at five-second boundary = %#v, first = %#v", boundary, first)
+	}
+	clock.Advance(notificationBurstWindow + time.Nanosecond)
+	afterWindow := do(t, owner, Command{Kind: Add, Candidate: baseCandidate})
+	if afterWindow.ID == first.ID || afterWindow.Replaced {
+		t.Fatalf("duplicate outside burst window = %#v, first = %#v", afterWindow, first)
+	}
+
+	for _, test := range []struct {
+		name   string
+		change func(*notify.Candidate)
+	}{
+		{name: "app name", change: func(candidate *notify.Candidate) { candidate.AppName = "other app" }},
+		{name: "summary", change: func(candidate *notify.Candidate) { candidate.Summary = "other summary" }},
+		{name: "body", change: func(candidate *notify.Candidate) { candidate.Body = "other body" }},
+		{name: "urgency", change: func(candidate *notify.Candidate) { candidate.Urgency = protocol.UrgencyCritical }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := baseCandidate
+			test.change(&candidate)
+			result := do(t, owner, Command{Kind: Add, Candidate: candidate})
+			if result.Replaced || result.ID == first.ID || result.ID == afterWindow.ID {
+				t.Fatalf("distinct key result = %#v, first = %#v, after window = %#v", result, first, afterWindow)
+			}
+		})
 	}
 }
 
@@ -457,7 +528,7 @@ func TestOwnerCapacityEvictsFiniteNonCriticalFirst(t *testing.T) {
 	criticalID := do(t, owner, Command{Kind: Add, Candidate: critical}).ID
 	finiteID := do(t, owner, Command{Kind: Add, Candidate: candidate("finite", time.Hour)}).ID
 	for i := 2; i < protocol.MaxActiveNotifications; i++ {
-		persistent := candidate("persistent", 0)
+		persistent := candidate("persistent "+strconv.Itoa(i), 0)
 		do(t, owner, Command{Kind: Add, Candidate: persistent})
 	}
 	do(t, owner, Command{Kind: Add, Candidate: candidate("overflow", time.Hour)})

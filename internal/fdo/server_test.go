@@ -227,8 +227,8 @@ func TestServerEmitsCloseReasons(t *testing.T) {
 	assertSignal(t, signals, "NotificationClosed", expired, uint32(protocol.CloseExpired))
 
 	oldest := sendNotify(t, h.object, 0, "oldest", nil, 0)
-	for range protocol.MaxActiveNotifications {
-		sendNotify(t, h.object, 0, "fill", nil, 0)
+	for i := range protocol.MaxActiveNotifications {
+		sendNotify(t, h.object, 0, "fill "+strconv.Itoa(i), nil, 0)
 	}
 	assertSignal(t, signals, "NotificationClosed", oldest, uint32(protocol.CloseUndefined))
 }
