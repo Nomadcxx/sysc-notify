@@ -520,7 +520,7 @@ func TestSnapshotWithManyWireImagesStillHandshakes(t *testing.T) {
 	ids := make([]uint32, 0, count)
 	for i := range count {
 		result, err := h.owner.Do(context.Background(), state.Command{Kind: state.Add, Candidate: notify.Candidate{
-			Summary: "image", Urgency: protocol.UrgencyNormal,
+			Summary: fmt.Sprintf("image-%d", i), Urgency: protocol.UrgencyNormal,
 			Image: &protocol.Image{
 				MediaType: "image/png", Width: protocol.MaxWireImageLongEdge, Height: protocol.MaxWireImageLongEdge,
 				Data: make([]byte, protocol.MaxWireImageBytes-i),
