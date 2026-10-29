@@ -53,11 +53,13 @@ func TestOwnerDeduplicatesBurstNotificationsAndRestartsExpiry(t *testing.T) {
 	baseCandidate.Body = "same body"
 
 	first := do(t, owner, Command{Kind: Add, Candidate: baseCandidate})
+	present(t, owner, 1, first.ID, protocol.PresentationVisible)
 	clock.Advance(4 * time.Second)
 	duplicate := do(t, owner, Command{Kind: Add, Candidate: baseCandidate})
 	if duplicate.ID != first.ID || !duplicate.Replaced {
 		t.Fatalf("duplicate result = %#v, first = %#v", duplicate, first)
 	}
+	present(t, owner, 1, first.ID, protocol.PresentationVisible)
 	if active := snapshot(t, owner).Active; len(active) != 1 || active[0].ID != first.ID {
 		t.Fatalf("active after duplicate = %#v", active)
 	}
@@ -66,6 +68,7 @@ func TestOwnerDeduplicatesBurstNotificationsAndRestartsExpiry(t *testing.T) {
 	if duplicate.ID != first.ID || !duplicate.Replaced {
 		t.Fatalf("second duplicate result = %#v, first = %#v", duplicate, first)
 	}
+	present(t, owner, 1, first.ID, protocol.PresentationVisible)
 
 	// The original deadline is t=10s; the second duplicate moves it to t=18s.
 	clock.Advance(3 * time.Second)
